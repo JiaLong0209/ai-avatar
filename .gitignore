@@ -1,0 +1,8 @@
+note
+**/__pycache__/
+**/*.pyc
+
+python_backend/T2M-GPT-main
+python_backend/ViT-B-32.pt
+
+AI-Desk-Avatar
