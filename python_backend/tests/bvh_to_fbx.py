@@ -21,7 +21,8 @@ def suppress_bpy_warnings():
 # ============================================================
 # Helper: Parse CLI arguments
 # Usage:
-#   blender -b -P bvh_to_fbx.py -- <input.bvh> <output.fbx>
+#   blender -b -P bvh_to_fbx.py -- input.bvh output.fbx
+#   OR call convert_bvh_to_fbx(bvh_path, fbx_path) directly
 # ============================================================
 def parse_args():
     argv = sys.argv
@@ -31,6 +32,7 @@ def parse_args():
         argv = []
     if len(argv) < 2:
         print("Usage: blender -b -P bvh_to_fbx.py -- <input.bvh> <output.fbx>")
+        print("OR call convert_bvh_to_fbx(bvh_path, fbx_path) directly")
         sys.exit(1)
     return os.path.abspath(argv[0]), os.path.abspath(argv[1])
 
@@ -38,7 +40,7 @@ def parse_args():
 # ============================================================
 # Convert BVH → FBX
 # ============================================================
-def bvh_to_fbx(bvh_path, fbx_path):
+def convert_bvh_to_fbx(bvh_path, fbx_path):
     print(f"Processing: {bvh_path}")
 
     # Clean scene
@@ -63,9 +65,9 @@ def bvh_to_fbx(bvh_path, fbx_path):
             armature = obj
             break
 
-    # Adjust rotation for Unity/VRM (Z-up → Y-up)
-    if armature:
-        armature.rotation_euler[0] = -1.5708  # -90° X rotation
+    # Adjust rotation for Unity/VRM (Z-up → Y-up); (But it was implemented in t2m)
+    # if armature:
+    #     armature.rotation_euler[0] = -1.5708  # -90° X rotation
 
     # Export FBX
     print(f"Exporting FBX → {fbx_path}")
@@ -95,6 +97,13 @@ def bvh_to_fbx(bvh_path, fbx_path):
 # Main entry
 # ============================================================
 if __name__ == "__main__":
-    bvh_path, fbx_path = parse_args()
-    bvh_to_fbx(bvh_path, fbx_path)
-    bpy.ops.wm.quit_blender()
+    # Check if we're running as a script with arguments
+    if len(sys.argv) > 1 and "--" in sys.argv:
+        bvh_path, fbx_path = parse_args()
+        convert_bvh_to_fbx(bvh_path, fbx_path)
+        bpy.ops.wm.quit_blender()
+    else:
+        # Running as imported module or without CLI args
+        # Example usage - you can call convert_bvh_to_fbx() directly
+        print("Script loaded. Call convert_bvh_to_fbx(bvh_path, fbx_path) to convert files.")
+        print("Example: convert_bvh_to_fbx('input.bvh', 'output.fbx')")

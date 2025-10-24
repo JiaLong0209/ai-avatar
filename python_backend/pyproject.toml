@@ -6,7 +6,7 @@ authors = [
     {name = "JiaLong0209",email = "smt02091395@gmail.com"}
 ]
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.12"
 
 dependencies = [
     "fastapi (>=0.116.1,<0.117.0)",
@@ -19,12 +19,13 @@ dependencies = [
     "python-multipart (>=0.0.20,<0.0.21)",
     "gtts (>=2.5.4,<3.0.0)",
     "torch (>=2.8.0,<3.0.0)",
-    "numpy (>=2.3.3,<3.0.0)",
+    "numpy (>=1.26,<2.0)",
     "openai-clip (>=1.0.1,<2.0.0)",
     "tqdm (>=4.67.1,<5.0.0)",
     "scipy (>=1.16.2,<2.0.0)",
     "pillow (>=11.3.0,<12.0.0)",
-    "torchvision (>=0.23.0,<0.24.0)"
+    "torchvision (>=0.23.0,<0.24.0)",
+    "bpy (>=4.5.3,<5.0.0)"
 ]
 
 

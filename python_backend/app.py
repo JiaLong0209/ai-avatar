@@ -7,6 +7,7 @@ import os
 from gtts import gTTS
 import ollama
 from t2m import T2MGenerator, T2MConfig
+from backend_utils.bvh_converter import convert_bvh_to_fbx_external
 
 
 app = FastAPI()
@@ -153,99 +154,54 @@ def _get_t2m_generator():
 
 
 @app.post("/t2m")
-async def t2m(text: str = Form(...), background_tasks: BackgroundTasks = BackgroundTasks()):
-    """Generate BVH motion file from text description."""
+async def t2m(text: str = Form(...), format: str = Form("fbx"), background_tasks: BackgroundTasks = BackgroundTasks()):
+    """Generate motion file from text description. Supports BVH and FBX formats."""
     
-    save_bvh = True
+    save_file = True
     try:
         generator = _get_t2m_generator()
         
         # Generate motion data
         motion_xyz = generator.generate_motion(text)
         
-        # Create temporary BVH file
-        # with tempfile.NamedTemporaryFile(delete=False, suffix=".bvh") as tmp:
-        #     bvh_path = tmp.name
-
-        bvh_path = "tests/test3.bvh"
-
-
+        # Determine output format and file paths
+        output_format = format.lower()
+        if output_format not in ["bvh", "fbx"]:
+            output_format = "fbx"
         
-        # Convert to BVH
+        # Create output file paths
+        bvh_path = f"tests/temp_motion_{hash(text) % 10000}.bvh"
+        fbx_path = f"tests/temp_motion_{hash(text) % 10000}.fbx"
+
+        # Always generate BVH first (required for FBX conversion)
         generator.motion_to_bvh(motion_xyz, bvh_path)
         
-        if not save_bvh:
-            # Clean up file after response
-            background_tasks.add_task(os.remove, bvh_path)
+        # Convert to FBX if requested
+        if output_format == "fbx":
+            success = convert_bvh_to_fbx_external(bvh_path, fbx_path)
+            if not success:
+                raise HTTPException(status_code=500, detail="Failed to convert BVH to FBX")
             
-        # Return file
-        return FileResponse(
-            path=bvh_path,
-            media_type="application/octet-stream",
-            filename=f"motion_{hash(text) % 10000}.bvh"
-        )
+            # Clean up BVH file if FBX was requested
+            if not save_file:
+                background_tasks.add_task(os.remove, bvh_path)
+            
+            return FileResponse(
+                path=fbx_path,
+                media_type="application/octet-stream",
+                filename=f"motion_{hash(text) % 10000}.fbx"
+            )
+        else:
+            # Return BVH file
+            if not save_file:
+                background_tasks.add_task(os.remove, bvh_path)
+            
+            return FileResponse(
+                path=bvh_path,
+                media_type="application/octet-stream",
+                filename=f"motion_{hash(text) % 10000}.bvh"
+            )
         
     except Exception as e:
         print(f"T2M generation error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to generate motion: {str(e)}")
-
-# # main.py
-
-# from fastapi import FastAPI
-# from pydantic import BaseModel
-# import requests
-# import json
-# import ollama
-
-# app = FastAPI()
-
-# # 設定 Ollama API
-# OLLAMA_URL = "http://localhost:11434/api/generate"
-# MODEL_NAME = "gemma:4b" 
-# # MODEL_NAME = "llama3:8b"
-
-# class Message(BaseModel):
-#     message: str
-
-# @app.post("/chat")
-# async def chat(msg: Message):
-#     # 傳送給 Ollama
-#     payload = {
-#         "model": MODEL_NAME,
-#         "prompt": msg.message,
-#         "stream": False  # True = streaming response, False = 一次回來
-#     }
-#     r = requests.post(OLLAMA_URL, data=json.dumps(payload))
-#     r.raise_for_status()
-
-#     # Ollama 回傳的 JSON 格式
-#     resp = r.json()["response"]
-#     return {"response": resp}
-
-
-
-
-
-# from fastapi import FastAPI, Request
-# from transformers import pipeline
-# from pydantic import BaseModel
-
-# app = FastAPI()
-# generator = pipeline("text-generation", model="gpt2")
-
-# class Message(BaseModel):
-#     message: str
-
-# @app.post("/chat")
-# async def chat(msg: Message):
-#     # output = generator(msg.message, max_length=50, do_sample=True)
-#     output = generator(
-#         msg.message,
-#         max_length=50,
-#         do_sample=True,
-#         truncation=True,  # <- add this
-#         pad_token_id=50256  # <- optional, but suppresses padding warning
-#     )
-#     return {"response": output[0]["generated_text"]}
-
-
