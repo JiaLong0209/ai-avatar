@@ -13,11 +13,17 @@ poetry add python-multipart
 poetry add gtts
 
 ## T2M
-poetry add torch numpy openai-clip tqdm scipy
+
+poetry add torch==2.8.0+cu121 --source pytorch-cu121
+poetry add torchvision==0.23.0+cu121 --source pytorch-cu121
+
+
+poetry add numpy openai-clip tqdm scipy
 
 poetry add pillow
-poetry add torchvision
 poetry add bpy
+
+
 
 ## Use python 3.11.9
 pyenv install 3.11.9
