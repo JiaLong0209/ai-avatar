@@ -4,10 +4,22 @@ from pydantic import BaseModel
 from typing import List, Optional, Literal
 import tempfile
 import os
+import re
+import logging
 from gtts import gTTS
 import ollama
 from t2m import T2MGenerator, T2MConfig
 from backend_utils.bvh_converter import convert_bvh_to_fbx_external
+import base64
+
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 
 app = FastAPI()
@@ -58,13 +70,13 @@ async def tts_post(text: str = Form(...), lang: Optional[str] = Form(None), form
 
 @app.post("/chat")
 async def chat(payload: ChatPayload):
-    print(f"payload: message={payload.message} messages={payload.messages}")
+    logger.debug(f"Chat payload received: message={payload.message}, messages={payload.messages}")
     # Build message list beginning with a system prompt to answer in Traditional Chinese
     compiled_messages: List[dict] = [
         {"role": "system", "content": "請使用繁體中文回答，並且簡短回覆，使用可愛的語氣"}
     ]
 
-    print(f"payload: {payload}")
+    logger.debug(f"Full payload: {payload}")
     if payload.messages and len(payload.messages) > 0:
         compiled_messages.extend(
             [{"role": m.role, "content": m.content} for m in payload.messages]
@@ -139,11 +151,13 @@ async def stt(file: UploadFile = File(...), lang: Optional[str] = Query("zh")):
 
 # ========= T2M (Text-to-Motion) =========
 _t2m_generator = None
+DEFAULT_MOTION_DIR = "tests/motions"
+
 
 def _get_t2m_generator():
+    """Lazy-load T2M generator to avoid initialization overhead."""
     global _t2m_generator
     if _t2m_generator is None:
-        # Adjust paths relative to the backend directory
         config = T2MConfig(
             vqvae_path='T2M-GPT-main/pretrained/VQVAE/net_last.pth',
             transformer_path='T2M-GPT-main/pretrained/VQTransformer_corruption05/net_best_fid.pth',
@@ -153,55 +167,381 @@ def _get_t2m_generator():
     return _t2m_generator
 
 
-@app.post("/t2m")
-async def t2m(text: str = Form(...), format: str = Form("fbx"), background_tasks: BackgroundTasks = BackgroundTasks()):
-    """Generate motion file from text description. Supports BVH and FBX formats."""
+def _sanitize_filename(text: str, max_length: int = 50) -> str:
+    """
+    Sanitize text for use in filename.
     
-    save_file = True
+    Args:
+        text: Text to sanitize
+        max_length: Maximum length of sanitized text
+    
+    Returns:
+        Sanitized filename-safe string
+    """
+    # Remove or replace invalid filename characters
+    sanitized = re.sub(r'[<>:"/\\|?*]', '', text)
+    sanitized = re.sub(r'\s+', '_', sanitized)  # Replace spaces with underscores
+    sanitized = sanitized.strip('._')  # Remove leading/trailing dots and underscores
+    
+    # Limit length and ensure it's not empty
+    if len(sanitized) > max_length:
+        sanitized = sanitized[:max_length]
+    
+    if not sanitized:
+        sanitized = "motion"
+    
+    return sanitized
+
+
+def _ensure_motion_directory(motion_dir: str = DEFAULT_MOTION_DIR) -> None:
+    """Ensure motion directory exists, create if it doesn't."""
+    os.makedirs(motion_dir, exist_ok=True)
+
+
+def _generate_motion_filename(motion_text: str, output_format: str, motion_dir: str = DEFAULT_MOTION_DIR) -> tuple[str, str]:
+    """
+    Generate motion file paths with descriptive naming.
+    
+    Args:
+        motion_text: Motion description text
+        output_format: Desired format ('fbx' or 'bvh')
+        motion_dir: Directory to store motion files
+    
+    Returns:
+        Tuple of (bvh_path, fbx_path)
+    """
+    _ensure_motion_directory(motion_dir)
+    
+    # Generate hash and sanitized text for filename
+    file_hash = abs(hash(motion_text)) % 10000
+    sanitized_text = _sanitize_filename(motion_text, max_length=50)
+    
+    # Create descriptive filename: motion_{hash}_{sanitized_text}.{ext}
+    base_name = f"motion_{file_hash}_{sanitized_text}"
+    bvh_path = os.path.join(motion_dir, f"{base_name}.bvh")
+    fbx_path = os.path.join(motion_dir, f"{base_name}.fbx")
+    
+    return bvh_path, fbx_path
+
+
+@app.post("/t2m")
+async def t2m(
+    text: str = Form(...),
+    format: str = Form("fbx"),
+    save_temp_files: bool = Form(True),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """
+    Generate motion file from text description. Supports BVH and FBX formats.
+    
+    Args:
+        text: Motion description text
+        format: Output format ('fbx' or 'bvh'), default 'fbx'
+        save_temp_files: Whether to save temporary motion files, default True
+    """
     try:
-        generator = _get_t2m_generator()
+        logger.info(f"[t2m] Motion text: {text}")
         
-        # Generate motion data
-        motion_xyz = generator.generate_motion(text)
-        
-        # Determine output format and file paths
+        # Validate and normalize format
         output_format = format.lower()
         if output_format not in ["bvh", "fbx"]:
             output_format = "fbx"
         
-        # Create output file paths
-        bvh_path = f"tests/temp_motion_{hash(text) % 10000}.bvh"
-        fbx_path = f"tests/temp_motion_{hash(text) % 10000}.fbx"
-
+        # Generate file paths with descriptive naming
+        bvh_path, fbx_path = _generate_motion_filename(text, output_format)
+        
+        # Generate motion
+        generator = _get_t2m_generator()
+        motion_xyz = generator.generate_motion(text)
+        
         # Always generate BVH first (required for FBX conversion)
         generator.motion_to_bvh(motion_xyz, bvh_path)
         
-        # Convert to FBX if requested
+        # Convert to requested format
         if output_format == "fbx":
             success = convert_bvh_to_fbx_external(bvh_path, fbx_path)
             if not success:
-                raise HTTPException(status_code=500, detail="Failed to convert BVH to FBX")
+                # Clean up on failure
+                try:
+                    os.remove(bvh_path)
+                except:
+                    pass
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to convert BVH to FBX. Check if converter is available."
+                )
             
-            # Clean up BVH file if FBX was requested
-            if not save_file:
+            # Schedule cleanup if not saving temp files
+            if not save_temp_files:
                 background_tasks.add_task(os.remove, bvh_path)
+                background_tasks.add_task(os.remove, fbx_path)
             
             return FileResponse(
                 path=fbx_path,
                 media_type="application/octet-stream",
-                filename=f"motion_{hash(text) % 10000}.fbx"
+                filename=os.path.basename(fbx_path)
             )
         else:
             # Return BVH file
-            if not save_file:
+            if not save_temp_files:
                 background_tasks.add_task(os.remove, bvh_path)
             
             return FileResponse(
                 path=bvh_path,
                 media_type="application/octet-stream",
-                filename=f"motion_{hash(text) % 10000}.bvh"
+                filename=os.path.basename(bvh_path)
             )
         
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"T2M generation error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate motion: {str(e)}")
+        logger.error(f"[t2m] Generation error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate motion: {str(e)}"
+        )
+
+
+class ChatT2MRequest(BaseModel):
+    payload: Optional[ChatPayload] = None
+    t2m_text: Optional[str] = None
+    format: Optional[str] = "fbx"
+    save_temp_files: Optional[bool] = True
+    motion_dir: Optional[str] = None  # Defaults to DEFAULT_MOTION_DIR if None
+
+
+def _extract_user_input(payload: Optional[ChatPayload]) -> Optional[str]:
+    """Extract the most recent user input from chat payload."""
+    if not payload:
+        return None
+    
+    if payload.messages:
+        # Find the last user message
+        for message in reversed(payload.messages):
+            if message.role == "user":
+                return message.content
+    elif payload.message:
+        return payload.message
+    
+    return None
+
+
+def _generate_motion_description_from_chat(user_input: str, chat_history: Optional[List[dict]] = None) -> str:
+    """
+    Use LLM to generate a concise English motion description from user input.
+    
+    Args:
+        user_input: The user's input text (e.g., LLM response or user message)
+        chat_history: Optional chat history for context
+    
+    Returns:
+        English motion description suitable for 3D motion generation
+    """
+    # Build message history if provided
+    messages: List[dict] = []
+    if chat_history:
+        messages.extend(chat_history)
+    
+    # Create a focused instruction for motion description generation
+    motion_instruction = (
+        "You are a motion description generator. Convert the given text into a concise, "
+        "clear English motion description suitable for 3D human motion generation.\n\n"
+        "Requirements:\n"
+        "- Use simple, action-focused language (e.g., 'a person waves their hand', 'someone jumps happily')\n"
+        "- Keep it under 25 words\n"
+        "- Focus on body movements and gestures\n"
+        "- Do not include dialogue, emotions without motion, or non-physical actions\n"
+        "- Output only the motion description, nothing else\n\n"
+        f"Input text: {user_input}\n\n"
+        "Motion description:"
+    )
+    
+    messages.append({"role": "system", "content": motion_instruction})
+    
+    response = ollama.chat(model=MODEL_NAME, messages=messages)
+    motion_text = response["message"]["content"].strip()
+    
+    # Clean up common LLM artifacts
+    motion_text = motion_text.strip('"\'')
+    if motion_text.lower().startswith("motion description:"):
+        motion_text = motion_text[len("motion description:"):].strip()
+    
+    logger.info(f"[chat_t2m] Generated motion text: {motion_text}")
+    return motion_text
+
+
+def _generate_motion_file(
+    motion_text: str,
+    output_format: str,
+    save_temp_files: bool = True,
+    motion_dir: Optional[str] = None
+) -> tuple[str, str]:
+    """
+    Generate motion file from description text.
+    
+    Args:
+        motion_text: English motion description
+        output_format: Desired format ('fbx' or 'bvh')
+        save_temp_files: Whether to save temporary motion files, default True
+        motion_dir: Directory to store motion files, defaults to DEFAULT_MOTION_DIR
+    
+    Returns:
+        Tuple of (file_path, file_base64)
+    """
+    # Validate and normalize format
+    output_format = output_format.lower()
+    if output_format not in ["fbx", "bvh"]:
+        output_format = "fbx"
+    
+    # Use provided directory or default
+    storage_dir = motion_dir if motion_dir else DEFAULT_MOTION_DIR
+    
+    # Generate file paths with descriptive naming
+    bvh_path, fbx_path = _generate_motion_filename(motion_text, output_format, storage_dir)
+    
+    # Generate motion
+    generator = _get_t2m_generator()
+    motion_xyz = generator.generate_motion(motion_text)
+    
+    # Generate BVH file (required as intermediate format)
+    generator.motion_to_bvh(motion_xyz, bvh_path)
+    
+    # Convert to requested format
+    if output_format == "fbx":
+        success = convert_bvh_to_fbx_external(bvh_path, fbx_path)
+        if not success:
+            # Clean up BVH file on failure
+            try:
+                os.remove(bvh_path)
+            except:
+                pass
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to convert BVH to FBX. Check if converter is available."
+            )
+        
+        final_path = fbx_path
+        
+        # Clean up intermediate BVH if not saving temp files
+        if not save_temp_files:
+            try:
+                os.remove(bvh_path)
+            except:
+                pass
+    else:
+        final_path = bvh_path
+    
+    # Read file and encode to base64
+    try:
+        with open(final_path, "rb") as f:
+            file_bytes = f.read()
+        file_b64 = base64.b64encode(file_bytes).decode("utf-8")
+        
+        # Clean up final file if not saving temp files
+        if not save_temp_files:
+            try:
+                os.remove(final_path)
+            except:
+                pass
+        
+        return final_path, file_b64
+    except Exception as e:
+        # Clean up on error
+        if not save_temp_files:
+            try:
+                if output_format == "fbx" and os.path.exists(bvh_path):
+                    os.remove(bvh_path)
+                if os.path.exists(final_path):
+                    os.remove(final_path)
+            except:
+                pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to read generated motion file: {str(e)}"
+        )
+
+
+@app.post("/chat_t2m")
+async def chat_t2m(req: ChatT2MRequest):
+    """
+    Generate motion from text description or chat context.
+    
+    This endpoint accepts either:
+    - Direct motion description in `t2m_text`
+    - Chat context in `payload` which will be processed to extract/generate motion description
+    
+    Args:
+        req: Request containing payload, t2m_text, format, save_temp_files, and motion_dir
+    
+    Returns:
+        Motion file as base64 along with metadata (motion_text, format, file_name, file_base64)
+    """
+    try:
+        # Step 1: Determine motion description text
+        # Always generate motion description from context, even if t2m_text is provided
+        # (t2m_text might be the LLM response in Chinese, not a motion description)
+        
+        # Build chat history from payload if available
+        chat_history: List[dict] = []
+        if req.payload and req.payload.messages:
+            chat_history = [{"role": m.role, "content": m.content} for m in req.payload.messages]
+        
+        # Determine input text for motion generation
+        user_input = None
+        
+        # If t2m_text is provided, use it as the primary input (usually LLM response)
+        if req.t2m_text:
+            user_input = req.t2m_text
+            logger.debug(f"[chat_t2m] Using provided t2m_text as input: {user_input}")
+        else:
+            # Otherwise, extract from payload
+            user_input = _extract_user_input(req.payload)
+        
+        if not user_input:
+            raise HTTPException(
+                status_code=400,
+                detail="Either 't2m_text' or valid 'payload' with user input is required"
+            )
+        
+        # Always generate motion description from the input (converts LLM response to motion description)
+        motion_text = _generate_motion_description_from_chat(user_input, chat_history)
+        
+        if not motion_text:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to generate motion description from input"
+            )
+        
+        # Log motion text for debugging
+        logger.info(f"[chat_t2m] Motion text: {motion_text}")
+        
+        # Step 2: Generate motion file
+        output_format = (req.format or "fbx").lower()
+        if output_format not in ["fbx", "bvh"]:
+            output_format = "fbx"
+        
+        save_temp_files = req.save_temp_files if req.save_temp_files is not None else True
+        motion_dir = req.motion_dir if req.motion_dir else None
+        
+        file_path, file_b64 = _generate_motion_file(
+            motion_text,
+            output_format,
+            save_temp_files=save_temp_files,
+            motion_dir=motion_dir
+        )
+        
+        return {
+            "motion_text": motion_text,
+            "format": output_format,
+            "file_name": os.path.basename(file_path),
+            "file_base64": file_b64,
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[chat_t2m] Error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"chat_t2m failed: {str(e)}"
+        )
