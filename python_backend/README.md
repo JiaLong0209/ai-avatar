@@ -64,7 +64,7 @@ ollama pull gemma3:4b
 ### 3. Run the Server
 
 ```bash
-poetry run uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+poetry run uvicorn app:app --port 8000 --reload
 ```
 
 ### 4. Test the API
@@ -347,6 +347,36 @@ yield return request.SendWebRequest();
 // Handle FBX/BVH response
 byte[] motionData = request.downloadHandler.data;
 File.WriteAllBytes("motion.fbx", motionData);
+```
+
+## Systemd 
+
+```bash
+# Create unit file: /etc/systemd/system/ai-avatar.service
+
+[Unit]
+# Description=AI Desk Avatar Backend
+# After=network.target
+
+# [Service]
+# WorkingDirectory=/home/user/ai-desk-avatar/python_backend
+# ExecStart=/home/user/ai-desk-avatar/python_backend/run.sh
+# User=user
+# Restart=always
+
+# [Install]
+# WantedBy=multi-user.target
+
+sudo systemctl status ai-avatar
+
+sudo systemctl daemon-reload
+
+sudo systemctl enable ai-avatar
+
+sudo systemctl start ai-avatar
+
+sudo systemctl restart ai-avatar
+
 ```
 
 ## 📝 License
