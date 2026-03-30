@@ -1,4 +1,4 @@
-# AI Desk Avatar - Python Backend
+# AI Avatar - Python Backend
 
 A multimodal AI backend system that provides chat, speech-to-text, text-to-speech, and text-to-motion capabilities for Unity-based virtual avatars.
 
@@ -46,15 +46,19 @@ This backend provides RESTful APIs for:
 ### Required Models and Data
 
 1. **T2M-GPT Models**: 
-   - Clone the [T2M-GPT repository](https://github.com/EricGuo5513/T2M-GPT) to `t2m-models/T2M-GPT-main/`
+   - Clone the [T2M-GPT repository](https://github.com/Mael-zys/T2M-GPT) to `t2m-models/T2M-GPT-main/`
    - Download pretrained models and place them in the `t2m-models/T2M-GPT-main` directory structure:
      - VQVAE: `t2m-models/T2M-GPT-main/pretrained/VQVAE/net_last.pth`
      - Transformer: `t2m-models/T2M-GPT-main/pretrained/VQTransformer_corruption05/net_best_fid.pth`
      - Metadata: `t2m-models/T2M-GPT-main/checkpoints/t2m/VQVAEV3_CB1024_CMT_H1024_NRES3/meta/`
-   - See [T2M-GPT README](https://github.com/EricGuo5513/T2M-GPT) for detailed setup instructions
 
-2. **VITS TTS Models** (optional, for TTS):
-   - Place VITS model files in `clean_vits/`:
+2. **MoMask Models**:
+   - Clone the [MoMask repository](https://github.com/EricGuo5513/momask-codes) to `t2m-models/momask/`
+   - Download pretrained models and place them in the `t2m-models/momask/checkpoints/t2m/` directory:
+     - Includes: `t2m_nlayer8...`, `VQ_NAME`, `tres_...`, `length_estimator`, etc.
+
+3. **VITS TTS Models** (optional, for TTS):
+   - Place VITS model files in `vits/` (or directory set in `VITS_MODEL_DIR`):
      - `G_latest.pth` (generator model)
      - `config.json` (model configuration)
    - If not available, the system will fall back to gTTS
@@ -389,53 +393,6 @@ The service logs to:
 
 Log rotation is handled automatically by the `run.sh` script (rotates at ~10MB).
 
-## 📁 Project Structure
-
-```
-python_backend/
-├── app.py                 # FastAPI main application
-├── config.py             # Configuration loader (YAML)
-├── config.yaml            # Configuration file
-├── pyproject.toml         # Poetry dependencies
-├── run.sh                 # Server startup script
-├── ai-avatar.service      # Systemd service file
-│
-├── services/              # Service layer
-│   ├── motion_service.py  # Motion generation service
-│   └── tts_service.py     # TTS service (VITS/gTTS)
-│
-├── t2m/                   # Text-to-Motion package
-│   ├── __init__.py
-│   └── generator.py      # T2M core logic
-│
-├── Motion/                # Motion processing library
-│   ├── Animation.py      # Animation data structures
-│   ├── InverseKinematics.py  # IK solver
-│   └── BVH.py            # BVH file I/O
-│
-├── backend_utils/         # Backend utilities
-│   ├── __init__.py
-│   └── bvh_converter.py  # BVH→FBX conversion (Blender)
-│
-├── clean_vits/            # VITS TTS models (optional)
-│   ├── G_latest.pth
-│   └── config.json
-│
-├── tests/                 # Test files
-│   ├── stt.sh            # STT test script
-│   ├── tts.sh            # TTS test script
-│   └── t2m.sh            # T2M test script
-│
-└── t2m-models/           # T2M Model Repositories
-    ├── T2M-GPT-main/     # T2M-GPT (Git Submodule/Clone)
-    ├── momask/           # MoMask (Git Submodule/Clone)
-    └── light-t2m-main/   # Light-T2M (Git Submodule/Clone)
-├── vits/                 # VITS TTS models (optional)
-│   ├── G_latest.pth
-│   └── config.json
-│
-```
-
 ## 🧪 Testing
 
 ### Test Chat
@@ -687,14 +644,6 @@ Contributions are welcome! Please ensure:
 - Add tests for new features
 - Update documentation as needed
 - Follow existing code style
-
-## 🔗 Related Resources
-
-- [FastAPI Documentation](https://fastapi.tiangolo.com/)
-- [Ollama Documentation](https://ollama.ai/docs)
-- [T2M-GPT Repository](https://github.com/EricGuo5513/T2M-GPT)
-- [UniVRM Unity Package](https://github.com/vrm-c/UniVRM)
-- [VITS Repository](https://github.com/jaywalnut310/vits)
 
 ---
 
