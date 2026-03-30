@@ -1,202 +1,91 @@
 """
-BVH to FBX conversion utility using Blender.
+BVH → FBX converter (Blender-only, external process)
+
+- No bpy import
+- Safe for FastAPI / Poetry / Uvicorn
+- Uses absolute paths to avoid CWD issues
 """
 
-import bpy
-import sys
-import os
-import contextlib
-import io
 import subprocess
-import tempfile
-from typing import Optional
+import sys
+from pathlib import Path
+from typing import Union
+
+import config
+BLENDER_PATH = config.BLENDER_PATH
+
+# Blender-side script (runs INSIDE Blender)
+BLENDER_SCRIPT = (
+    Path(__file__).parent / "convert_bvh_to_fbx.py"
+).resolve()
 
 
-@contextlib.contextmanager
-def suppress_bpy_warnings():
-    """Temporarily suppress Blender console warnings (FBX/BVH import)."""
-    old_stdout, old_stderr = sys.stdout, sys.stderr
-    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
-    try:
-        yield
-    finally:
-        sys.stdout, sys.stderr = old_stdout, old_stderr
+def _resolve_path(path: Union[str, Path]) -> Path:
+    """
+    Resolve to absolute path (critical for cross-process safety)
+    """
+    return Path(path).expanduser().resolve()
 
 
 def convert_bvh_to_fbx(bvh_path: str, fbx_path: str) -> bool:
     """
-    Convert BVH file to FBX using Blender.
-    
+    Convert BVH → FBX using an external Blender process.
+
+    This function is SAFE to call from FastAPI.
+    It does NOT require bpy in the Python environment.
+
     Args:
-        bvh_path: Path to input BVH file
-        fbx_path: Path to output FBX file
-        
+        bvh_path: input .bvh path (relative or absolute)
+        fbx_path: output .fbx path (relative or absolute)
+
     Returns:
         True if conversion successful, False otherwise
+
+    Raises:
+        RuntimeError if Blender fails or FBX is not created
     """
-    try:
-        print(f"Processing: {bvh_path}")
+    bvh_path = _resolve_path(bvh_path)
+    fbx_path = _resolve_path(fbx_path)
 
-        # Clean scene
-        bpy.ops.wm.read_factory_settings(use_empty=True)
+    # Ensure output directory exists
+    fbx_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Import BVH (quietly)
-        with suppress_bpy_warnings():
-            bpy.ops.import_anim.bvh(
-                filepath=bvh_path,
-                axis_forward='-Z',
-                axis_up='Y',
-                filter_glob="*.bvh",
-                global_scale=1.0,
-            )
+    if not bvh_path.exists():
+        raise FileNotFoundError(f"BVH file not found: {bvh_path}")
 
-        # Rename Armature
-        armature = None
-        for obj in bpy.data.objects:
-            if obj.type == 'ARMATURE':
-                obj.name = "T2M_Armature"
-                bpy.context.view_layer.objects.active = obj
-                armature = obj
-                break
+    if not BLENDER_SCRIPT.exists():
+        raise FileNotFoundError(f"Blender script not found: {BLENDER_SCRIPT}")
 
-        if armature is None:
-            print("Error: No armature found in BVH file")
-            return False
+    cmd = [
+        BLENDER_PATH,
+        "--background",
+        "--factory-startup",
+        "--python",
+        str(BLENDER_SCRIPT),
+        "--",
+        str(bvh_path),
+        str(fbx_path),
+    ]
 
-        # Export FBX
-        print(f"Exporting FBX → {fbx_path}")
-        bpy.ops.export_scene.fbx(
-            filepath=fbx_path,
-            use_selection=False,
-            apply_scale_options='FBX_SCALE_ALL',
-            object_types={'ARMATURE'},
-            bake_anim=True,
-            bake_anim_use_nla_strips=False,
-            bake_anim_use_all_actions=False,
-            bake_anim_force_startend_keying=False,
-            add_leaf_bones=False,
-            axis_forward='-Z',
-            axis_up='Y',
-        )
-
-        # Cleanup
-        bpy.ops.object.delete()
-        for block in bpy.data.objects:
-            bpy.data.objects.remove(block, do_unlink=True)
-
-        print(f"✅ Exported: {fbx_path}")
-        return True
-
-    except Exception as e:
-        print(f"Error converting BVH to FBX: {e}")
-        return False
-
-
-def convert_bvh_to_fbx_external(bvh_path: str, fbx_path: str, blender_path: Optional[str] = None) -> bool:
-    """
-    Convert BVH to FBX using external Blender process.
-    This is safer for production use as it doesn't interfere with the main process.
-    
-    Args:
-        bvh_path: Path to input BVH file
-        fbx_path: Path to output FBX file
-        blender_path: Path to Blender executable (auto-detect if None)
-        
-    Returns:
-        True if conversion successful, False otherwise
-    """
-    try:
-        # Auto-detect Blender path
-        if blender_path is None:
-            blender_path = "blender"  # Assume it's in PATH
-        
-        # Create temporary script
-        script_content = f'''
-import bpy
-import sys
-import os
-import contextlib
-import io
-
-@contextlib.contextmanager
-def suppress_bpy_warnings():
-    old_stdout, old_stderr = sys.stdout, sys.stderr
-    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
-    try:
-        yield
-    finally:
-        sys.stdout, sys.stderr = old_stdout, old_stderr
-
-def convert():
-    bvh_path = "{bvh_path}"
-    fbx_path = "{fbx_path}"
-    
-    # Clean scene
-    bpy.ops.wm.read_factory_settings(use_empty=True)
-
-    # Import BVH
-    with suppress_bpy_warnings():
-        bpy.ops.import_anim.bvh(
-            filepath=bvh_path,
-            axis_forward='-Z',
-            axis_up='Y',
-            filter_glob="*.bvh",
-            global_scale=1.0,
-        )
-
-    # Rename Armature
-    for obj in bpy.data.objects:
-        if obj.type == 'ARMATURE':
-            obj.name = "T2M_Armature"
-            bpy.context.view_layer.objects.active = obj
-            break
-
-    # Export FBX
-    bpy.ops.export_scene.fbx(
-        filepath=fbx_path,
-        use_selection=False,
-        apply_scale_options='FBX_SCALE_ALL',
-        object_types={{'ARMATURE'}},
-        bake_anim=True,
-        bake_anim_use_nla_strips=False,
-        bake_anim_use_all_actions=False,
-        bake_anim_force_startend_keying=False,
-        add_leaf_bones=False,
-        axis_forward='-Z',
-        axis_up='Y',
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
 
-    print(f"✅ Exported: {{fbx_path}}")
+    # Blender process failed
+    if result.returncode != 0:
+        print("========== Blender STDOUT ==========")
+        print(result.stdout)
+        print("========== Blender STDERR ==========", file=sys.stderr)
+        print(result.stderr, file=sys.stderr)
+        raise RuntimeError("Blender BVH → FBX conversion failed")
 
-if __name__ == "__main__":
-    convert()
-    bpy.ops.wm.quit_blender()
-'''
-        
-        # Write script to temporary file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as script_file:
-            script_file.write(script_content)
-            script_path = script_file.name
+    # Final safety check (this is what fixes your FastAPI crash)
+    if not fbx_path.exists():
+        raise RuntimeError(
+            f"FBX not created by Blender: {fbx_path}"
+        )
 
-        try:
-            # Run Blender with the script
-            cmd = [blender_path, "-b", "-P", script_path]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            
-            if result.returncode == 0:
-                print(f"✅ BVH to FBX conversion successful: {fbx_path}")
-                return True
-            else:
-                print(f"Blender conversion failed: {result.stderr}")
-                return False
-            
-        finally:
-            # Clean up temporary script
-            try:
-                os.remove(script_path)
-            except:
-                pass
-                
-    except Exception as e:
-        print(f"Error in external BVH to FBX conversion: {e}")
-        return False
+    return True

@@ -4,14 +4,14 @@ from pydantic import BaseModel
 from typing import List, Optional, Literal
 import tempfile
 import os
-import re
 import logging
-from gtts import gTTS
-import ollama
-from t2m import T2MGenerator, T2MConfig
-from backend_utils.bvh_converter import convert_bvh_to_fbx_external
-import base64
+import time
+from functools import wraps
 
+from t2m import T2MConfig
+from services.motion_service import get_motion_service, MotionService
+from services.tts_service import get_tts_service, TtsService
+import config
 
 # Configure logging
 logging.basicConfig(
@@ -19,64 +19,252 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+
 logger = logging.getLogger(__name__)
 
+# --- LLM Provider Setup ---
+import ollama
+genai = None
+try:
+    import google.generativeai as _genai
+    genai = _genai
+    logger.info("Successfully imported google.generativeai")
+except ImportError as e:
+    logger.error(f"Failed to import google.generativeai: {e}")
+except Exception as e:
+    logger.error(f"Unexpected error importing google.generativeai: {e}")
+
+# --- CONFIGURATION ---
+USE_DIRECT_6D_METHOD = False  # Set to True to use 6D rotation direct conversion, False for Analytical IK
+# USE_DIRECT_6D_METHOD = True  
+
+# Options: "t2m-gpt", "light-t2m", "mdm", "momask"
+# ACTIVE_T2M_MODEL = "t2m-gpt" 
+# ACTIVE_T2M_MODEL = "mdm" 
+ACTIVE_T2M_MODEL = "momask" 
 
 app = FastAPI()
 
-# 使用するモデル
-MODEL_NAME = "gemma3:4b"
-# MODEL_NAME = "llama3:8b"
-default_stt_lang = "zh"
+logger.info(f"USE_DIRECT_6D_METHOD: {USE_DIRECT_6D_METHOD}")
+logger.info(f"ACTIVE_T2M_MODEL: {ACTIVE_T2M_MODEL}")
 
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
 
 class ChatPayload(BaseModel):
-    # Backward-compat: accept a single message
-    message: Optional[str] = None
-    # New: accept full message history
-    messages: Optional[List[ChatMessage]] = None
+    """Chat payload with message history."""
+    message: Optional[str] = None  # Backward-compat: single message
+    messages: Optional[List[ChatMessage]] = None  # Full message history
 
-def _tts_mp3_bytes(text: str, lang: Optional[str]) -> bytes:
-    t = gTTS(text=text, lang=(lang or "zh"))
-    tmpfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-    t.save(tmpfile.name)
-    with open(tmpfile.name, "rb") as f:
-        data = f.read()
-    return data
 
+# ========= Decorators =========
+def log_execution_time(endpoint_name: str):
+    """Decorator to log endpoint execution time."""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            start_time = time.time()
+            try:
+                result = await func(*args, **kwargs)
+                return result
+            finally:
+                elapsed = time.time() - start_time
+                logger.info(f"{endpoint_name}: executed in {elapsed:.3f}s")
+        return wrapper
+    return decorator
+
+# ========= TTS (Text-to-Speech) =========
 @app.get("/tts")
-async def tts_get(text: str = Query(...), lang: Optional[str] = Query(None), format: Optional[str] = Query("mp3")):
-    fmt = (format or "mp3").lower()
-    if fmt == "mp3":
-        data = _tts_mp3_bytes(text, lang)
-        return Response(content=data, media_type="audio/mpeg")
-    else:
-        # For now only mp3 implemented fully; extend as needed
-        data = _tts_mp3_bytes(text, lang)
-        return Response(content=data, media_type="audio/mpeg")
+@log_execution_time("/tts [GET]")
+async def tts_get(
+    text: str = Query(...),
+    lang: Optional[str] = Query(None),
+    provider: Optional[str] = Query(None),
+    format: Optional[str] = Query(None)
+):
+    """
+    Generate speech audio from text (GET).
+    
+    Args:
+        text: Text to synthesize
+        lang: Language code (defaults to configured default)
+        provider: TTS provider ("vits" or "gtts"), defaults to configured default
+        format: Output format (deprecated, auto-detected from provider)
+    
+    Returns:
+        Audio response
+    """
+    tts_service = get_tts_service()
+    provider_type: Optional[Literal["vits", "gtts"]] = (
+        provider.lower() if provider else None
+    )
+    
+    try:
+        audio_bytes, content_type = tts_service.synthesize(
+            text=text,
+            lang=lang or config.DEFAULT_TTS_LANG,
+            provider=provider_type
+        )
+        return Response(content=audio_bytes, media_type=content_type)
+    except Exception as e:
+        logger.error(f"[tts] Generation error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate speech: {str(e)}"
+        )
+
 
 @app.post("/tts")
-async def tts_post(text: str = Form(...), lang: Optional[str] = Form(None), format: Optional[str] = Form("mp3")):
-    fmt = (format or "mp3").lower()
-    if fmt == "mp3":
-        data = _tts_mp3_bytes(text, lang)
-        return Response(content=data, media_type="audio/mpeg")
-    else:
-        data = _tts_mp3_bytes(text, lang)
-        return Response(content=data, media_type="audio/mpeg")
+@log_execution_time("/tts [POST]")
+async def tts_post(
+    text: str = Form(...),
+    lang: Optional[str] = Form(None),
+    provider: Optional[str] = Form(None),
+    format: Optional[str] = Form(None)
+):
+    """
+    Generate speech audio from text (POST).
+    
+    Args:
+        text: Text to synthesize
+        lang: Language code (defaults to configured default)
+        provider: TTS provider ("vits" or "gtts"), defaults to configured default (VITS)
+        format: Output format (deprecated, auto-detected from provider)
+    
+    Returns:
+        Audio response
+    """
+    tts_service = get_tts_service()
+    provider_type: Optional[Literal["vits", "gtts"]] = (
+        provider.lower() if provider else None
+    )
+    
+    try:
+        audio_bytes, content_type = tts_service.synthesize(
+            text=text,
+            lang=lang or config.DEFAULT_TTS_LANG,
+            provider=provider_type
+        )
+        return Response(content=audio_bytes, media_type=content_type)
+    except Exception as e:
+        logger.error(f"[tts] Generation error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate speech: {str(e)}"
+        )
 
+# ========= Helpers =========
+def _log_full_context(endpoint_tag: str, messages: List[dict]):
+    """
+    Log the full chat context in a structured, readable format.
+    """
+    log_lines = [f"\n=== [{endpoint_tag}] Full Context Start ==="]
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "unknown").upper()
+        content = msg.get("content", "").strip()
+        # Truncate very long content for readability if needed, but user asked for full context.
+        # We'll keep it full but indented.
+        log_lines.append(f"[{i}] {role}: {content}")
+    log_lines.append(f"=== [{endpoint_tag}] Full Context End ===\n")
+    logger.info("\n".join(log_lines))
+    
+def _get_llm_response(compiled_messages: List[dict]) -> str:
+    """Helper to get response from configured LLM provider."""
+    provider = config.LLM_PROVIDER.lower()
+    
+    if provider == "gemini":
+        if not genai:
+            raise RuntimeError("Gemini SDK (google-generativeai) not installed")
+        if not config.GOOGLE_API_KEY:
+            raise RuntimeError("GOOGLE_API_KEY not configured")
+        
+        genai.configure(api_key=config.GOOGLE_API_KEY)
+        model = genai.GenerativeModel(config.GEMINI_MODEL_NAME)
+        
+        # Convert messages to Gemini format
+        # Gemini usually expects a specific history format or a flattened string for simple calls.
+        # We'll use the ChatSession for history.
+        
+        if not compiled_messages:
+            return "No messages provided"
+            
+        # Separate the last message as the "prompt/trigger"
+        # Everything else is history or system instructions
+        trigger_msg = compiled_messages[-1]
+        history_msgs = compiled_messages[:-1]
+        
+        system_instruction = ""
+        history = []
+        
+        for msg in history_msgs:
+            role = msg["role"]
+            content = msg["content"]
+            if role == "system":
+                system_instruction += content + "\n"
+            elif role == "user":
+                history.append({"role": "user", "parts": [content]})
+            elif role == "assistant":
+                history.append({"role": "model", "parts": [content]})
+        
+        # If the trigger message is also a system message, add it to instructions
+        # and use a generic prompt if no other content. But usually we want 
+        # the trigger message's content to be the send_message argument.
+        prompt = trigger_msg["content"]
+        if trigger_msg["role"] == "system":
+            # If the last message is system, we treat it as the instruction to be executed
+            # against the cumulative history. In Gemini, this is effectively a user prompt 
+            # saying "Hey system, do this based on above".
+            pass 
+        
+        # We use simple generate_content with system prompt prepended for now, 
+        # or use system_instruction if the model supports it (Gemini 1.5+ does)
+        try:
+            # Try with system_instruction (available in newer SDKs/Models)
+            model_with_sys = genai.GenerativeModel(
+                model_name=config.GEMINI_MODEL_NAME,
+                system_instruction=system_instruction.strip()
+            )
+            
+            chat_session = model_with_sys.start_chat(history=history)
+            response = chat_session.send_message(prompt)
+            return response.text
+                
+        except Exception as e:
+            logger.warning(f"Gemini system_instruction failed or not supported: {e}. Falling back to prefixing.")
+            # Fallback for models that don't support system_instruction
+            full_prompt = f"System Instruction: {system_instruction}\n\nTask: {prompt}"
+            
+            chat_session = model.start_chat(history=history)
+            response = chat_session.send_message(full_prompt)
+            return response.text
+
+    else: # Default to Ollama
+        response = ollama.chat(model=config.LLM_MODEL_NAME, messages=compiled_messages)
+        return response["message"]["content"]
+
+
+# ========= Chat =========
 @app.post("/chat")
+@log_execution_time("/chat")
 async def chat(payload: ChatPayload):
+    """
+    Chat endpoint for LLM conversation.
+    
+    Args:
+        payload: Chat payload with message or message history
+    
+    Returns:
+        LLM response
+    """
     logger.debug(f"Chat payload received: message={payload.message}, messages={payload.messages}")
-    # Build message list beginning with a system prompt to answer in Traditional Chinese
+    
+    # Build message list with system prompt
     compiled_messages: List[dict] = [
-        {"role": "system", "content": "請使用繁體中文回答，並且簡短回覆，使用可愛的語氣"}
+        {"role": "system", "content": config.CHAT_SYSTEM_PROMPT}
     ]
-
-    logger.debug(f"Full payload: {payload}")
+    
+    # Add user messages
     if payload.messages and len(payload.messages) > 0:
         compiled_messages.extend(
             [{"role": m.role, "content": m.content} for m in payload.messages]
@@ -84,16 +272,15 @@ async def chat(payload: ChatPayload):
     elif payload.message is not None:
         compiled_messages.append({"role": "user", "content": payload.message})
     else:
-        # Fallback empty prompt (unlikely in normal use)
         compiled_messages.append({"role": "user", "content": ""})
+    
+    
+    # 3. Log the full context before sending to LLM
+    _log_full_context("chat", compiled_messages)
 
-    response = ollama.chat(
-        model=MODEL_NAME,
-        messages=compiled_messages,
-    )
-
-    # Ollama の返答内容を抽出
-    answer = response["message"]["content"]
+    # 4. Get LLM response
+    answer = _get_llm_response(compiled_messages)
+    
     return {"response": answer}
 
 # ========= STT (Whisper / Faster-Whisper) =========
@@ -136,95 +323,39 @@ def _transcribe_audio(path: str, language: str = "zh") -> str:
 
 
 @app.post("/stt")
+@log_execution_time("/stt")
 async def stt(file: UploadFile = File(...), lang: Optional[str] = Query("zh")):
+    """Speech-to-text endpoint."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
         tmp.write(await file.read())
         tmp_path = tmp.name
+    
     try:
-        text = _transcribe_audio(tmp_path, language=(lang or default_stt_lang))
+        text = _transcribe_audio(tmp_path, language=(lang or config.DEFAULT_STT_LANG))
         return {"text": text}
     finally:
         try:
             os.remove(tmp_path)
-        except Exception:
+        except OSError:
             pass
 
 # ========= T2M (Text-to-Motion) =========
-_t2m_generator = None
-DEFAULT_MOTION_DIR = "tests/motions"
-
-
-def _get_t2m_generator():
-    """Lazy-load T2M generator to avoid initialization overhead."""
-    global _t2m_generator
-    if _t2m_generator is None:
-        config = T2MConfig(
-            vqvae_path='T2M-GPT-main/pretrained/VQVAE/net_last.pth',
-            transformer_path='T2M-GPT-main/pretrained/VQTransformer_corruption05/net_best_fid.pth',
-            meta_path='T2M-GPT-main/checkpoints/t2m/VQVAEV3_CB1024_CMT_H1024_NRES3/meta/'
-        )
-        _t2m_generator = T2MGenerator(config)
-    return _t2m_generator
-
-
-def _sanitize_filename(text: str, max_length: int = 50) -> str:
-    """
-    Sanitize text for use in filename.
-    
-    Args:
-        text: Text to sanitize
-        max_length: Maximum length of sanitized text
-    
-    Returns:
-        Sanitized filename-safe string
-    """
-    # Remove or replace invalid filename characters
-    sanitized = re.sub(r'[<>:"/\\|?*]', '', text)
-    sanitized = re.sub(r'\s+', '_', sanitized)  # Replace spaces with underscores
-    sanitized = sanitized.strip('._')  # Remove leading/trailing dots and underscores
-    
-    # Limit length and ensure it's not empty
-    if len(sanitized) > max_length:
-        sanitized = sanitized[:max_length]
-    
-    if not sanitized:
-        sanitized = "motion"
-    
-    return sanitized
-
-
-def _ensure_motion_directory(motion_dir: str = DEFAULT_MOTION_DIR) -> None:
-    """Ensure motion directory exists, create if it doesn't."""
-    os.makedirs(motion_dir, exist_ok=True)
-
-
-def _generate_motion_filename(motion_text: str, output_format: str, motion_dir: str = DEFAULT_MOTION_DIR) -> tuple[str, str]:
-    """
-    Generate motion file paths with descriptive naming.
-    
-    Args:
-        motion_text: Motion description text
-        output_format: Desired format ('fbx' or 'bvh')
-        motion_dir: Directory to store motion files
-    
-    Returns:
-        Tuple of (bvh_path, fbx_path)
-    """
-    _ensure_motion_directory(motion_dir)
-    
-    # Generate hash and sanitized text for filename
-    file_hash = abs(hash(motion_text)) % 10000
-    sanitized_text = _sanitize_filename(motion_text, max_length=50)
-    
-    # Create descriptive filename: motion_{hash}_{sanitized_text}.{ext}
-    base_name = f"motion_{file_hash}_{sanitized_text}"
-    bvh_path = os.path.join(motion_dir, f"{base_name}.bvh")
-    fbx_path = os.path.join(motion_dir, f"{base_name}.fbx")
-    
-    return bvh_path, fbx_path
+def _get_motion_service() -> MotionService:
+    """Get configured motion service instance."""
+    t2m_config = T2MConfig(
+        vqvae_path=config.T2M_VQVAE_PATH,
+        transformer_path=config.T2M_TRANSFORMER_PATH,
+        meta_path=config.T2M_META_PATH
+    )
+    return get_motion_service(
+        t2m_config=t2m_config, 
+        default_motion_dir=config.DEFAULT_MOTION_DIR,
+        model_name=ACTIVE_T2M_MODEL
+    )
 
 
 @app.post("/t2m")
+@log_execution_time("/t2m")
 async def t2m(
     text: str = Form(...),
     format: str = Form("fbx"),
@@ -238,59 +369,38 @@ async def t2m(
         text: Motion description text
         format: Output format ('fbx' or 'bvh'), default 'fbx'
         save_temp_files: Whether to save temporary motion files, default True
+    
+    Returns:
+        FileResponse with motion file
     """
     try:
         logger.info(f"[t2m] Motion text: {text}")
+        motion_service = _get_motion_service()
+        output_format = motion_service.validate_format(format)
         
-        # Validate and normalize format
-        output_format = format.lower()
-        if output_format not in ["bvh", "fbx"]:
-            output_format = "fbx"
+        # Get file paths for cleanup if needed
+        bvh_path, fbx_path = motion_service.generate_file_paths(text)
+        final_path = fbx_path if output_format == "fbx" else bvh_path
         
-        # Generate file paths with descriptive naming
-        bvh_path, fbx_path = _generate_motion_filename(text, output_format)
+        # Generate motion file (no cleanup - we handle it with background tasks)
+        file_path, _ = motion_service.generate_motion_file(
+            motion_text=text,
+            output_format=output_format,
+            use_direct_6d=USE_DIRECT_6D_METHOD
+        )
         
-        # Generate motion
-        generator = _get_t2m_generator()
-        motion_xyz = generator.generate_motion(text)
+        # Schedule cleanup if not saving temp files
+        if not save_temp_files:
+            background_tasks.add_task(_cleanup_file, file_path)
+            # Also clean up intermediate BVH if FBX was generated
+            if output_format == "fbx" and bvh_path != file_path:
+                background_tasks.add_task(_cleanup_file, bvh_path)
         
-        # Always generate BVH first (required for FBX conversion)
-        generator.motion_to_bvh(motion_xyz, bvh_path)
-        
-        # Convert to requested format
-        if output_format == "fbx":
-            success = convert_bvh_to_fbx_external(bvh_path, fbx_path)
-            if not success:
-                # Clean up on failure
-                try:
-                    os.remove(bvh_path)
-                except:
-                    pass
-                raise HTTPException(
-                    status_code=500,
-                    detail="Failed to convert BVH to FBX. Check if converter is available."
-                )
-            
-            # Schedule cleanup if not saving temp files
-            if not save_temp_files:
-                background_tasks.add_task(os.remove, bvh_path)
-                background_tasks.add_task(os.remove, fbx_path)
-            
-            return FileResponse(
-                path=fbx_path,
-                media_type="application/octet-stream",
-                filename=os.path.basename(fbx_path)
-            )
-        else:
-            # Return BVH file
-            if not save_temp_files:
-                background_tasks.add_task(os.remove, bvh_path)
-            
-            return FileResponse(
-                path=bvh_path,
-                media_type="application/octet-stream",
-                filename=os.path.basename(bvh_path)
-            )
+        return FileResponse(
+            path=file_path,
+            media_type="application/octet-stream",
+            filename=os.path.basename(file_path)
+        )
         
     except HTTPException:
         raise
@@ -300,6 +410,15 @@ async def t2m(
             status_code=500,
             detail=f"Failed to generate motion: {str(e)}"
         )
+
+
+def _cleanup_file(file_path: str) -> None:
+    """Helper to safely remove a file."""
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except OSError:
+        pass
 
 
 class ChatT2MRequest(BaseModel):
@@ -343,125 +462,28 @@ def _generate_motion_description_from_chat(user_input: str, chat_history: Option
         messages.extend(chat_history)
     
     # Create a focused instruction for motion description generation
-    motion_instruction = (
-        "You are a motion description generator. Convert the given text into a concise, "
-        "clear English motion description suitable for 3D human motion generation.\n\n"
-        "Requirements:\n"
-        "- Use simple, action-focused language (e.g., 'a person waves their hand', 'someone jumps happily')\n"
-        "- Keep it under 25 words\n"
-        "- Focus on body movements and gestures\n"
-        "- Do not include dialogue, emotions without motion, or non-physical actions\n"
-        "- Output only the motion description, nothing else\n\n"
-        f"Input text: {user_input}\n\n"
-        "Motion description:"
-    )
-    
+    motion_instruction = config.MOTION_DESCRIPTION_PROMPT.format(user_input=user_input)
     messages.append({"role": "system", "content": motion_instruction})
     
-    response = ollama.chat(model=MODEL_NAME, messages=messages)
-    motion_text = response["message"]["content"].strip()
+    # Log full context
+    _log_full_context("chat_t2m", messages)
+    
+    motion_text = _get_llm_response(messages)
+    motion_text = motion_text.strip()
     
     # Clean up common LLM artifacts
     motion_text = motion_text.strip('"\'')
     if motion_text.lower().startswith("motion description:"):
         motion_text = motion_text[len("motion description:"):].strip()
     
-    logger.info(f"[chat_t2m] Generated motion text: {motion_text}")
+    logger.info(f"[chat_t2m] Generated motion_text: {motion_text}")
     return motion_text
 
 
-def _generate_motion_file(
-    motion_text: str,
-    output_format: str,
-    save_temp_files: bool = True,
-    motion_dir: Optional[str] = None
-) -> tuple[str, str]:
-    """
-    Generate motion file from description text.
-    
-    Args:
-        motion_text: English motion description
-        output_format: Desired format ('fbx' or 'bvh')
-        save_temp_files: Whether to save temporary motion files, default True
-        motion_dir: Directory to store motion files, defaults to DEFAULT_MOTION_DIR
-    
-    Returns:
-        Tuple of (file_path, file_base64)
-    """
-    # Validate and normalize format
-    output_format = output_format.lower()
-    if output_format not in ["fbx", "bvh"]:
-        output_format = "fbx"
-    
-    # Use provided directory or default
-    storage_dir = motion_dir if motion_dir else DEFAULT_MOTION_DIR
-    
-    # Generate file paths with descriptive naming
-    bvh_path, fbx_path = _generate_motion_filename(motion_text, output_format, storage_dir)
-    
-    # Generate motion
-    generator = _get_t2m_generator()
-    motion_xyz = generator.generate_motion(motion_text)
-    
-    # Generate BVH file (required as intermediate format)
-    generator.motion_to_bvh(motion_xyz, bvh_path)
-    
-    # Convert to requested format
-    if output_format == "fbx":
-        success = convert_bvh_to_fbx_external(bvh_path, fbx_path)
-        if not success:
-            # Clean up BVH file on failure
-            try:
-                os.remove(bvh_path)
-            except:
-                pass
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to convert BVH to FBX. Check if converter is available."
-            )
-        
-        final_path = fbx_path
-        
-        # Clean up intermediate BVH if not saving temp files
-        if not save_temp_files:
-            try:
-                os.remove(bvh_path)
-            except:
-                pass
-    else:
-        final_path = bvh_path
-    
-    # Read file and encode to base64
-    try:
-        with open(final_path, "rb") as f:
-            file_bytes = f.read()
-        file_b64 = base64.b64encode(file_bytes).decode("utf-8")
-        
-        # Clean up final file if not saving temp files
-        if not save_temp_files:
-            try:
-                os.remove(final_path)
-            except:
-                pass
-        
-        return final_path, file_b64
-    except Exception as e:
-        # Clean up on error
-        if not save_temp_files:
-            try:
-                if output_format == "fbx" and os.path.exists(bvh_path):
-                    os.remove(bvh_path)
-                if os.path.exists(final_path):
-                    os.remove(final_path)
-            except:
-                pass
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to read generated motion file: {str(e)}"
-        )
-
+# ========= Chat T2M =========
 
 @app.post("/chat_t2m")
+@log_execution_time("/chat_t2m")
 async def chat_t2m(req: ChatT2MRequest):
     """
     Generate motion from text description or chat context.
@@ -474,61 +496,48 @@ async def chat_t2m(req: ChatT2MRequest):
         req: Request containing payload, t2m_text, format, save_temp_files, and motion_dir
     
     Returns:
-        Motion file as base64 along with metadata (motion_text, format, file_name, file_base64)
+        Motion file as base64 along with metadata
     """
     try:
-        # Step 1: Determine motion description text
-        # Always generate motion description from context, even if t2m_text is provided
-        # (t2m_text might be the LLM response in Chinese, not a motion description)
-        
-        # Build chat history from payload if available
+        # Step 1: Extract user input and build chat history
         chat_history: List[dict] = []
         if req.payload and req.payload.messages:
             chat_history = [{"role": m.role, "content": m.content} for m in req.payload.messages]
         
-        # Determine input text for motion generation
-        user_input = None
-        
-        # If t2m_text is provided, use it as the primary input (usually LLM response)
-        if req.t2m_text:
-            user_input = req.t2m_text
-            logger.debug(f"[chat_t2m] Using provided t2m_text as input: {user_input}")
-        else:
-            # Otherwise, extract from payload
-            user_input = _extract_user_input(req.payload)
-        
+        user_input = req.t2m_text or _extract_user_input(req.payload)
         if not user_input:
             raise HTTPException(
                 status_code=400,
                 detail="Either 't2m_text' or valid 'payload' with user input is required"
             )
         
-        # Always generate motion description from the input (converts LLM response to motion description)
+        # Step 2: Generate motion description from input (converts LLM response to motion description)
+        start_step2 = time.time()
+        # Logging handled inside _generate_motion_description_from_chat now
         motion_text = _generate_motion_description_from_chat(user_input, chat_history)
-        
+        logger.info(f"[chat_t2m] LLM Motion Description duration: {time.time() - start_step2:.4f}s")
         if not motion_text:
             raise HTTPException(
                 status_code=500,
                 detail="Failed to generate motion description from input"
             )
         
-        # Log motion text for debugging
         logger.info(f"[chat_t2m] Motion text: {motion_text}")
         
-        # Step 2: Generate motion file
-        output_format = (req.format or "fbx").lower()
-        if output_format not in ["fbx", "bvh"]:
-            output_format = "fbx"
-        
+        # Step 3: Generate motion file
+        start_step3 = time.time()
+        motion_service = _get_motion_service()
+        output_format = motion_service.validate_format(req.format or "fbx")
         save_temp_files = req.save_temp_files if req.save_temp_files is not None else True
-        motion_dir = req.motion_dir if req.motion_dir else None
         
-        file_path, file_b64 = _generate_motion_file(
-            motion_text,
-            output_format,
+        file_path, file_b64 = motion_service.generate_motion_file_with_cleanup(
+            motion_text=motion_text,
+            output_format=output_format,
+            motion_dir=req.motion_dir,
             save_temp_files=save_temp_files,
-            motion_dir=motion_dir
+            use_direct_6d=USE_DIRECT_6D_METHOD
         )
+        logger.info(f"[chat_t2m] T2M Generation duration: {time.time() - start_step3:.4f}s")
         
         return {
             "motion_text": motion_text,
@@ -545,3 +554,4 @@ async def chat_t2m(req: ChatT2MRequest):
             status_code=500,
             detail=f"chat_t2m failed: {str(e)}"
         )
+

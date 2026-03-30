@@ -1,0 +1,100 @@
+# AI Desk Avatar Backend Configuration
+
+# Model Configuration
+llm:
+  # provider: "ollama"  # Options: "ollama", "gemini"
+  provider: "gemini"  # Options: "ollama", "gemini"
+  model_name: "gemma3:4b"  # For Ollama
+  gemini:
+    model_name: "gemma-3-4b-it"
+    api_key: "" # Recommended to set via environment variable GEMINI_API_KEY
+
+# Language Configuration
+language:
+  default_stt: "zh"
+  default_tts: "zh"
+
+# Chat Prompts
+chat:
+  system_prompt: |
+    你是一個活潑開朗的人。
+    請遵守以下規則：
+    1. 語言:必須使用「繁體中文」。
+    2. 長度:回答必須「簡短」，控制在兩句話以內，適合語音播放。
+    3. 格式:禁止使用Emoji (如 😀)，因為語音念出來會很怪。
+    4. 情緒:請多多使用「顏文字」(如 OuO、>w<、(｀・ω・´)) 來表達心情。
+    5. 語氣:像好朋友一樣輕鬆聊天，不要太拘謹，可以適度吐槽。
+      
+
+motion_description_prompt: |
+  You are a motion description translator for 3D animation. Convert the input into a single, direct English sentence describing the physical movement.
+
+  Strict Rules:
+  1. PREFER SPECIFIC TERMS: If the input names a specific exercise, dance move, or action (e.g., "handstand", "backflip", "t-pose", "salsa"), use that exact term. Do NOT deconstruct it into steps (e.g., do NOT say "puts hands on floor and kicks legs up" -> just say "performs a handstand").
+  2. BE DIRECT: Use the format "A person [action]."
+  3. REMOVE FLUFF: Remove all dialogue, context, personality traits, or emotional adjectives that don't affect movement.
+  4. LENGTH: Keep it under 15 words.
+
+  Examples:
+  - Input: "I want him to do a handstand now." -> Output: "A person performs a handstand."
+  - Input: "Can you make her wave hello to the camera?" -> Output: "A person waves their right hand."
+  - Input: "He is walking like he is sad." -> Output: "A person walks slowly with head down."
+
+  Input text: {user_input}
+
+  Motion description:
+
+# T2M (Text-to-Motion) Configuration
+t2m:
+  vqvae_path: "t2m-models/T2M-GPT-main/pretrained/VQVAE/net_last.pth"
+  transformer_path: "t2m-models/T2M-GPT-main/pretrained/VQTransformer_corruption05/net_best_fid.pth"
+  meta_path: "t2m-models/T2M-GPT-main/checkpoints/t2m/VQVAEV3_CB1024_CMT_H1024_NRES3/meta/"
+  
+  # Model-specific settings
+  models:
+    momask:
+      motion_length: 180   # 0 = Auto-detect based on text
+      max_motion_length: 400
+    t2m_gpt:
+      motion_length: 180
+      max_motion_length: 400
+
+# VITS TTS Configuration
+vits:
+  model_dir: "vits"
+  model_path: "vits/G_latest.pth"
+  config_path: "vits/config.json"
+  default_speaker: "default"
+  default_speed: 1.0
+  default_language: "ZH"  # ZH, JA, EN
+  languages:
+    JA:
+      name: "日本語"
+      mark: "[JA]"
+      code: "ja"
+    ZH:
+      name: "简体中文"
+      mark: "[ZH]"
+      code: "zh-CN"
+    EN:
+      name: "English"
+      mark: "[EN]"
+      code: "en"
+  lang_mapping:
+    zh: "ZH"
+    zh-CN: "ZH"
+    zh-TW: "ZH"
+    ja: "JA"
+    jpn: "JA"
+    en: "EN"
+    eng: "EN"
+
+# Motion Configuration
+motion:
+  default_dir: "tests/motions"
+
+# TTS Provider Configuration
+tts:
+  default_provider: "vits"  # "vits" or "gtts"
+  # default_provider: "gtts"  # "vits" or "gtts"
+
