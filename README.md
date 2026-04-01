@@ -1,6 +1,6 @@
 # AI-Avatar: Multimodal Real-time Interaction System
 
-本專案是一個整合 **LLM (大語言模型)**、**TTS (語音合成)**、**STT (語音轉文字)** 與 **T2M (文字轉動作)** 的實時虛擬人互動系統。透過 Python 後端進行推理，並於 Unity 端實現 VRM 模型的互動。
+本專案是一個整合 **LLM (大語言模型)**、**TTS (語音合成)**、**STT (語音轉文字)** 與 **T2M (文字轉動作)** 的即時 VRM 角色聊天互動系統。透過 Python 後端進行推理，並於 Unity 端實現 VRM 模型的互動。
 
 ---
 
@@ -14,7 +14,7 @@
 - **Networking Module**: 使用 `UnityWebRequest` 與後端伺服器通訊。
 <!-- - **Audio Player & uLipSync**: 處理語音播放與即時口型同步。 -->
 
-### FastAPI Backend (Python 3.10+)
+### FastAPI Backend (Python 3.11.9)
 - **LLM Service**: 集成 Ollama (Gemma 3) 或 Google Gemini，負責對話邏輯。
 - **TTS Service**: 基於 VITS 或 gTTS，將文字轉換為高質量的語音。
 - **T2M Service**: 使用 MoMask 或 T2M-GPT 模型，根據描述生成 3D 動作。
@@ -172,7 +172,8 @@
 ### 啟動後端
 ```bash
 cd python_backend
-poetry install
+poetry install --no-root
+poetry shell
 ./run.sh
 ```
 

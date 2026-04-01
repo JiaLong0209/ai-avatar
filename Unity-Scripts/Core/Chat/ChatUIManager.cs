@@ -21,20 +21,35 @@ public class ChatUIManager : MonoBehaviour
     [SerializeField] public TextMeshProUGUI chatHistoryText;
     [SerializeField] public TextMeshProUGUI statusText;
 
-    [Header("Backend URLs")]
+    [Header("API Endpoints")]
     [SerializeField] private string chatUrl = "http://localhost:8000/chat";
     [SerializeField] private string chatT2mUrl = "http://localhost:8000/chat_t2m";
+    [SerializeField] private string chatAndMotionUrl = "http://localhost:8000/chat_and_motion";
+
+    [Header("API Flow Configuration")]
+    [Tooltip("If true, chat and motion are requested in a single API call, allowing simultaneous audio/motion playback.")]
+    public bool useCombinedFlow = true;
+
+    [Header("Display Settings")]
+    [Tooltip("If true, AI response text appears one character at a time.")]
+    public bool useTypewriter = true;
+    public float charDisplaySpeed = 0.1f;
 
     [Header("Motion Playback")]
     [SerializeField] private MotionManager motionManager;
     [SerializeField] private bool autoFindMotionManager = true;
 
     [Header("Motion Generation Context")]
-    [SerializeField] [Range(1, 10)] private int contextUserMessageCount = 5;
-    [SerializeField] [Range(1, 10)] private int contextAssistantMessageCount = 5;
+    [SerializeField] [Range(1, 100)] private int contextUserMessageCount = 20;
+    [SerializeField] [Range(1, 100)] private int contextAssistantMessageCount = 20;
     [SerializeField] private bool useContextForMotion = true;
 
+    public enum MotionFormat { FBX, BVH }
+    [Header("Motion Generation Format")]
+    [SerializeField] private MotionFormat outputFormat = MotionFormat.BVH;
+
     private StringBuilder chatHistory = new StringBuilder();
+    private Coroutine typingCoroutine;
 
     // Static property to let other scripts check focus status
     public static bool IsInputFocused { get; private set; }
@@ -46,11 +61,19 @@ public class ChatUIManager : MonoBehaviour
         // 1. Replace newlines with space
         string text = rawText.Replace("\n", " ").Replace("\r", " ");
 
-        // 2. Remove Emojis
-        // \p{Cs} matches Surrogate codes, which covers most emojis in UTF-16
-        // \p{So} matches Symbol, Other
-        // This regex removes surrogates and "Symbol, Other" characters
+        // 2. Remove Emojis & Symbols
         text = Regex.Replace(text, @"\p{Cs}|\p{So}", "");
+
+        // 3. Remove 顏文字 (Emoticons) patterns
+        // Matches common strings like OuO, >w<, OwO, ^_^, etc.
+        text = Regex.Replace(text, @"[O>o\^][w_]*[O<o\^]", "");
+        
+        // Remove complex ones like (｀・ω・´), (´・ω・`), etc.
+        // This removes mostly brackets and unusual punctuation that 顏文字 use
+        text = Regex.Replace(text, @"\([^\)]*[\u3000-\u303F\uFF00-\uFFEF][^\)]*\)", "");
+        
+        // Final cleanup of extra spaces
+        text = Regex.Replace(text, @"\s+", " ");
 
         return text.Trim();
     }
@@ -97,27 +120,36 @@ public class ChatUIManager : MonoBehaviour
         }
 
         // 2. "Enter" 鍵：觸發按鈕邏輯
-        // 檢查 Enter 是否被按下
         if (keyboard.enterKey.wasPressedThisFrame || keyboard.numpadEnterKey.wasPressedThisFrame)
         {
-            // 條件：輸入框有焦點 且 內容不是空白
             if (userInputUI.isFocused && !string.IsNullOrWhiteSpace(userInputUI.text))
             {
-                // 直接呼叫按鈕的 onClick 事件（這會讓 UI 按鈕有被點擊的反應）
-                if (sendButton != null)
-                {
-                    sendButton.onClick.Invoke();
-                }
-                else
-                {
-                    // 如果沒掛載按鈕，則直接執行方法
-                    OnSendClicked();
-                }
-
-                // 發送後讓輸入框失去焦點（或是保持聚焦，看你的操作習慣）
+                if (sendButton != null) sendButton.onClick.Invoke();
+                else OnSendClicked();
                 userInputUI.DeactivateInputField();
             }
         }
+
+        // 3. "Ctrl + Backspace" 鍵：清除歷史紀錄與 UI
+        if (keyboard.shiftKey.isPressed && keyboard.backspaceKey.wasPressedThisFrame)
+        {
+            ClearChatHistory();
+        }
+    }
+
+    private void ClearChatHistory()
+    {
+        // 1. 清除 UI 顯示
+        if (chatHistoryText != null) chatHistoryText.text = "";
+        if (responseText != null) responseText.text = "";
+        if (userInputUI != null) userInputUI.text = "";
+        if (statusText != null) statusText.text = "History Cleared";
+
+        // 2. 清除內部資料
+        chatHistory.Clear();
+        ChatHistoryManager.Instance.Clear();
+
+        Debug.Log("[ChatUIManager] Chat history and UI cleared.");
     }
 
     public void OnSendClicked()
@@ -134,8 +166,16 @@ public class ChatUIManager : MonoBehaviour
         AppendToHistory("----------------\nYou: " + text);
         userInputUI.text = string.Empty;
 
-        Debug.Log("[ChatUIManager] Starting chat request and motion generation");
-        StartCoroutine(SendChatRequestThenT2M(text));
+        if (useCombinedFlow)
+        {
+            Debug.Log("[ChatUIManager] Starting combined chat & motion flow");
+            StartCoroutine(SendCombinedChatAndMotion(text));
+        }
+        else
+        {
+            Debug.Log("[ChatUIManager] Starting chained chat request and motion generation");
+            StartCoroutine(SendChatRequestThenT2M(text));
+        }
     }
 
     // ====== Chained Flow: Chat Request -> Motion Generation ======
@@ -159,7 +199,115 @@ public class ChatUIManager : MonoBehaviour
         }
     }
 
-    // ====== Chat Text API ======
+    // ====== Combined Flow: Unified Chat & Motion ======
+    private IEnumerator SendCombinedChatAndMotion(string userInput)
+    {
+        statusTextSet("Thinking and generating motion...");
+
+        ChatPayload payload = ChatHistoryManager.Instance != null ? 
+            ChatHistoryManager.Instance.CreatePayload() : 
+            new ChatPayload { messages = new System.Collections.Generic.List<ChatMessage>() };
+
+        var requestPayload = new ChatPayloadReq
+        {
+            payload = payload,
+            t2m_text = userInput, 
+            format = outputFormat.ToString().ToLower()
+        };
+
+        string jsonPayload = JsonUtility.ToJson(requestPayload);
+        var request = new UnityWebRequest(chatAndMotionUrl, "POST");
+        byte[] bodyRaw = Encoding.UTF8.GetBytes(jsonPayload);
+        request.uploadHandler = new UploadHandlerRaw(bodyRaw);
+        request.downloadHandler = new DownloadHandlerBuffer();
+        request.SetRequestHeader("Content-Type", "application/json");
+
+        // Allow plenty of time for LLM JSON gen + Motion Gen
+        request.timeout = 120; 
+
+        yield return request.SendWebRequest();
+
+        if (request.result == UnityWebRequest.Result.Success)
+        {
+            string jsonResponse = request.downloadHandler.text;
+            CombinedChatResponse response = JsonUtility.FromJson<CombinedChatResponse>(jsonResponse);
+
+            if (response != null)
+            {
+                // 1. Process Text
+                string reply = response.reply ?? string.Empty;
+                
+                if (useTypewriter)
+                {
+                    if (typingCoroutine != null) StopCoroutine(typingCoroutine);
+                    typingCoroutine = StartCoroutine(TypeTextResponse(reply));
+                }
+                else
+                {
+                    if (responseText != null) responseText.text = reply;
+                    AppendToHistory("AI: " + reply);
+                }
+
+                if (ChatHistoryManager.Instance != null)
+                    ChatHistoryManager.Instance.AddAssistantMessage(reply);
+
+                // 2. Process Audio (Text-to-Speech)
+                if (TtsManager.Instance != null && !string.IsNullOrEmpty(reply))
+                {
+                    string ttsText = CleanTextForTts(reply);
+                    Debug.Log($"[ChatUIManager] TTS Speaking: {ttsText}");
+                    TtsManager.Instance.Speak(ttsText);
+                }
+
+                // 3. Process Motion
+                if (!string.IsNullOrEmpty(response.file_base64) && !string.IsNullOrEmpty(response.file_name))
+                {
+                    try
+                    {
+                        byte[] fileData = System.Convert.FromBase64String(response.file_base64);
+                        
+                        string extension = response.format == "bvh" ? ".bvh" : ".fbx";
+                        string fileName = response.file_name.EndsWith(extension) ? response.file_name : response.file_name + extension;
+                        
+                        string savePath = Path.Combine(Application.dataPath, "Animations", "Generated", fileName);
+                        
+                        string directory = Path.GetDirectoryName(savePath);
+                        if (!Directory.Exists(directory))
+                        {
+                            Directory.CreateDirectory(directory);
+                        }
+
+                        File.WriteAllBytes(savePath, fileData);
+                        Debug.Log($"[ChatUIManager] Saved combined motion file to {savePath}");
+
+                        // Play the motion synchronously with TTS
+                        if (MotionManager.Instance != null)
+                        {
+                            MotionManager.Instance.PlayMotion(savePath);
+                        }
+                    }
+                    catch (System.Exception e)
+                    {
+                        Debug.LogError($"[ChatUIManager] Failed to save/play combined motion: {e.Message}");
+                    }
+                }
+                else
+                {
+                    Debug.LogWarning("[ChatUIManager] No motion file returned in combined response.");
+                }
+                
+                statusTextSet("Ready");
+            }
+        }
+        else
+        {
+            Debug.LogError($"Combined API failed: {request.error}\n{request.downloadHandler.text}");
+            statusTextSet("Error: " + request.error);
+        }
+    }
+
+
+    // ====== UI Helper Methods ======
     private IEnumerator SendChatRequest(string userInput, System.Action<string> onResponse = null)
     {
         ChatPayload payload = ChatHistoryManager.Instance.CreatePayload();
@@ -179,10 +327,16 @@ public class ChatUIManager : MonoBehaviour
             string fullJson = request.downloadHandler.text;
             string cleaned = ParseAIResponse(fullJson);
 
-            if (responseText != null)
-                responseText.text = cleaned;
-
-            AppendToHistory("AI: " + cleaned);
+            if (useTypewriter)
+            {
+                if (typingCoroutine != null) StopCoroutine(typingCoroutine);
+                typingCoroutine = StartCoroutine(TypeTextResponse(cleaned));
+            }
+            else
+            {
+                if (responseText != null) responseText.text = cleaned;
+                AppendToHistory("AI: " + cleaned);
+            }
 
             if (ChatHistoryManager.Instance != null)
                 ChatHistoryManager.Instance.AddAssistantMessage(cleaned);
@@ -242,7 +396,7 @@ public class ChatUIManager : MonoBehaviour
         {
             payload = contextPayload,
             t2m_text = llmResponse, // Pass LLM response, backend will generate motion description from it
-            format = "fbx"
+            format = outputFormat.ToString().ToLower()
         };
 
         string json = JsonUtility.ToJson(payload);
@@ -268,7 +422,9 @@ public class ChatUIManager : MonoBehaviour
 
             if (resp != null && !string.IsNullOrEmpty(resp.file_base64))
             {
-                string fileName = string.IsNullOrEmpty(resp.file_name) ? "motion.fbx" : resp.file_name;
+                string extension = outputFormat == MotionFormat.FBX ? ".fbx" : ".bvh";
+                string baseName = string.IsNullOrEmpty(resp.file_name) ? "motion" : Path.GetFileNameWithoutExtension(resp.file_name);
+                string fileName = $"{baseName}{extension}";
 
                 string path;
 #if UNITY_EDITOR
@@ -383,5 +539,40 @@ public class ChatUIManager : MonoBehaviour
         public string format;
         public string file_name;
         public string file_base64;
+    }
+
+    [System.Serializable]
+    public class CombinedChatResponse
+    {
+        public string reply;
+        public string motion_text;
+        public string format;
+        public string file_name;
+        public string file_base64;
+    }
+    private IEnumerator TypeTextResponse(string fullText)
+    {
+        Debug.Log($"[ChatUIManager] TypeTextResponse started. Speed: {charDisplaySpeed}");
+        
+        string baseHistory = chatHistory.ToString() + "AI: ";
+        if (chatHistoryText != null) chatHistoryText.text = baseHistory;
+        if (responseText != null) responseText.text = "";
+        
+        string currentTyping = "";
+        foreach (char c in fullText)
+        {
+            currentTyping += c;
+            
+            if (responseText != null) responseText.text = currentTyping;
+            if (chatHistoryText != null) chatHistoryText.text = baseHistory + currentTyping;
+            
+            yield return new WaitForSeconds(charDisplaySpeed);
+        }
+        
+        // Finalize by committing to StringBuilder
+        chatHistory.AppendLine("AI: " + fullText);
+        
+        Debug.Log("[ChatUIManager] TypeTextResponse finished.");
+        typingCoroutine = null;
     }
 }

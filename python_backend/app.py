@@ -39,9 +39,9 @@ USE_DIRECT_6D_METHOD = False  # Set to True to use 6D rotation direct conversion
 # USE_DIRECT_6D_METHOD = True  
 
 # Options: "t2m-gpt", "light-t2m", "mdm", "momask"
-# ACTIVE_T2M_MODEL = "t2m-gpt" 
+ACTIVE_T2M_MODEL = "t2m-gpt" 
 # ACTIVE_T2M_MODEL = "mdm" 
-ACTIVE_T2M_MODEL = "momask" 
+# ACTIVE_T2M_MODEL = "momask" 
 
 app = FastAPI()
 
@@ -101,8 +101,12 @@ async def tts_get(
     )
     
     try:
+        # Clean text for TTS (remove emoticons, etc.)
+        cleaned_text = _clean_text_for_tts(text)
+        logger.info(f"[tts-get] Text for synthesis: {cleaned_text}")
+        
         audio_bytes, content_type = tts_service.synthesize(
-            text=text,
+            text=cleaned_text if cleaned_text else " ",
             lang=lang or config.DEFAULT_TTS_LANG,
             provider=provider_type
         )
@@ -141,8 +145,12 @@ async def tts_post(
     )
     
     try:
+        # Clean text for TTS (remove emoticons, etc.)
+        cleaned_text = _clean_text_for_tts(text)
+        logger.info(f"[tts] Text for synthesis: {cleaned_text}")
+        
         audio_bytes, content_type = tts_service.synthesize(
-            text=text,
+            text=cleaned_text if cleaned_text else " ",
             lang=lang or config.DEFAULT_TTS_LANG,
             provider=provider_type
         )
@@ -168,7 +176,41 @@ def _log_full_context(endpoint_tag: str, messages: List[dict]):
         log_lines.append(f"[{i}] {role}: {content}")
     log_lines.append(f"=== [{endpoint_tag}] Full Context End ===\n")
     logger.info("\n".join(log_lines))
+
+def _clean_text_for_tts(text: str) -> str:
+    """
+    Clean text for TTS by removing emoticons, emojis, and unusual symbols.
+    """
+    import re
+    if not text:
+        return ""
     
+    # 1. Replace newlines with space
+    text = text.replace("\n", " ").replace("\r", " ")
+    
+    # 2. Remove 顏文字 (Emoticons)
+    # Pattern 1: Common bubble/bracket emoticons like (｀・ω・´), (´・ω・`), (o^^o), ( ´ ▽ ` ), etc.
+    # We look for something starting with ( and ending with ) containing non-speech characters
+    # \u2000-\u30ff includes varied symbols, arrows, CJK punctuation
+    text = re.sub(r'\([^\)]*[\u2000-\u30ff\u2500-\u2bff\uff00-\uffef][^\)]*\)', '', text)
+    
+    # Pattern 2: Simple ones like OuO, >w<, OwO, ^_^, T_T, etc.
+    text = re.sub(r'[O>o\^=][w_@~\.]*[O<o\^=][ \d]*', '', text)
+    text = re.sub(r'[\^][\-_/]+[\^]', '', text)
+    text = re.sub(r'[T][\-_/]+[T]', '', text)
+    text = re.sub(r'[;-][\_]*[DPp\)]', '', text) # ;) , :-D etc
+    
+    # Pattern 3: Action symbols/misc
+    text = re.sub(r'\\o/|/o\\|/s', '', text)
+    
+    # 3. Final regex: Remove anything that's NOT a word (letter/digit), CJK, or standard punctuation
+    # We'll allow spaces and most common punctuation
+    text = re.sub(r'[^\w\s\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uff00-\uffef\u3000-\u303f.,!?，。！？\-]', '', text)
+    
+    # 4. Cleanup extra spaces
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
 def _get_llm_response(compiled_messages: List[dict]) -> str:
     """Helper to get response from configured LLM provider."""
     provider = config.LLM_PROVIDER.lower()
@@ -553,5 +595,106 @@ async def chat_t2m(req: ChatT2MRequest):
         raise HTTPException(
             status_code=500,
             detail=f"chat_t2m failed: {str(e)}"
+        )
+
+
+@app.post("/chat_and_motion")
+@log_execution_time("/chat_and_motion")
+async def chat_and_motion(req: ChatT2MRequest):
+    """
+    Combined endpoint: Generate BOTH chat reply and motion description in one LLM call,
+    then generate the motion file, returning everything in one unified JSON package.
+    """
+    try:
+        import re
+        import json
+        
+        chat_history: List[dict] = []
+        if req.payload and req.payload.messages:
+            chat_history = [{"role": m.role, "content": m.content} for m in req.payload.messages]
+        
+        user_input = req.t2m_text or _extract_user_input(req.payload)
+        if not user_input:
+            raise HTTPException(status_code=400, detail="Input required")
+            
+        # 1. Build messages with the combined JSON prompt
+        messages: List[dict] = [
+            {"role": "system", "content": config.CHAT_AND_MOTION_PROMPT}
+        ]
+        messages.extend(chat_history)
+        
+        # If user_input was extracted from payload it's already in chat_history.
+        # But if it's t2m_text, we should append it.
+        if req.t2m_text and not (req.payload and req.payload.messages):
+            messages.append({"role": "user", "content": req.t2m_text})
+            
+        _log_full_context("chat_and_motion", messages)
+        
+        # 2. Get LLM response (Expected to be JSON)
+        start_llm = time.time()
+        raw_response = _get_llm_response(messages)
+        logger.info(f"[chat_and_motion] LLM JSON duration: {time.time() - start_llm:.4f}s")
+        
+        # 3. Parse JSON safely
+        reply_text = "我聽懂了，但生成動作時發生了一點小錯誤 OuO"
+        motion_text = "A person stands still."
+        
+        # log LLM raw response
+        logger.info(f"[chat_and_motion] LLM Raw Response: {raw_response}")
+        
+        try:
+            # Find JSON block in case there's markdown ```json ... ```
+            json_match = re.search(r'\{.*\}', raw_response, re.DOTALL)
+            json_str = json_match.group(0) if json_match else raw_response
+            parsed = json.loads(json_str)
+            
+            # Pretty print the JSON in console
+            logger.info("\n=== [chat_and_motion] Parsed LLM JSON ===\n" + 
+                        json.dumps(parsed, indent=4, ensure_ascii=False) + 
+                        "\n=========================================")
+
+            if "reply" in parsed:
+                reply_text = parsed["reply"]
+            if "motion_text" in parsed:
+                motion_text = parsed["motion_text"]
+        except Exception as e:
+            logger.error(f"[chat_and_motion] Failed to parse JSON from LLM: {raw_response}. Error: {e}")
+            # Fallback heuristics if absolutely needed
+            if "motion_text" not in raw_response and "reply" not in raw_response:
+                reply_text = raw_response
+        
+        logger.info(f"[chat_and_motion] Extracted Reply: {reply_text}")
+        logger.info(f"[chat_and_motion] Extracted Motion: {motion_text}")
+
+        # 4. Generate Motion
+        start_t2m = time.time()
+        motion_service = _get_motion_service()
+        output_format = motion_service.validate_format(req.format or "fbx")
+        save_temp_files = req.save_temp_files if req.save_temp_files is not None else True
+        
+        file_path, file_b64 = motion_service.generate_motion_file_with_cleanup(
+            motion_text=motion_text,
+            output_format=output_format,
+            motion_dir=req.motion_dir,
+            save_temp_files=save_temp_files,
+            use_direct_6d=USE_DIRECT_6D_METHOD
+        )
+        logger.info(f"[chat_and_motion] T2M duration: {time.time() - start_t2m:.4f}s")
+        
+        return {
+            "reply": reply_text,
+            "motion_text": motion_text,
+            "format": output_format,
+            "file_name": os.path.basename(file_path),
+            "file_base64": file_b64,
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[chat_and_motion] Error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"chat_and_motion failed: {str(e)}"
         )
 

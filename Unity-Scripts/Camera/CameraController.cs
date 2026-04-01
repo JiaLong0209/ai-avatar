@@ -1,34 +1,107 @@
 using UnityEngine;
-using UnityEngine.InputSystem; // new Input System
+using UnityEngine.InputSystem;
+
+public enum CameraMode
+{
+    Free,
+    Follow
+}
 
 public class CameraController : MonoBehaviour
 {
-    [SerializeField] private float moveSpeed = 50f;
-    [SerializeField] private float lookSensitivity = 3f;
-    [SerializeField] private float scrollSpeed = 50f;
+    [Header("General Settings")]
+    public CameraMode currentMode = CameraMode.Free;
+    
+    [Header("Target Settings (Follow Mode)")]
+    public Transform target;
+    public Vector3 targetOffset = new Vector3(0, 1.5f, 0);
+    public float startingDistance = 3.0f;
+    
+    [Header("Movement Settings")]
+    public float freeMoveSpeed = 6f;
+    public float followSmoothSpeed = 10f;
+    
+    [Header("Rotation Settings")]
+    public float lookSensitivity = 12f; // Used for Free mode
+    public float rotateSpeed = 0.2f;    // Used for Follow mode
+    
+    [Header("Zoom Settings (Follow Mode)")]
+    public float zoomSpeed = 0.5f;
+    public float minDistance = 1.0f;
+    public float maxDistance = 10.0f;
 
-    private float xRot;
-    private float yRot;
+    [Header("Rotation Constraints (Follow Mode)")]
+    public float minPitch = -90f;
+    public float maxPitch = 90;
+
+    // Tracking variables
+    private float currentYaw = 0f;
+    private float currentPitch = 0f;
+    private float currentDistance;
 
     void Start()
     {
-        // Cursor.lockState = CursorLockMode.Locked;
+        // Initialize rotation and viewing distance tracking
+        currentDistance = startingDistance;
+        Vector3 angles = transform.eulerAngles;
+        currentYaw = angles.y;
+        currentPitch = angles.x;
+
+        if (target == null && currentMode == CameraMode.Follow)
+        {
+            Debug.LogWarning("[CameraController] Follow mode active but target is unassigned!");
+        }
     }
 
     void Update()
     {
-        HandleLook();
-        // HandleScroll();
-
-        // Stop camera movement if user is typing in chat
+        // Stop camera movement/actions if user is typing in chat
         if (ChatUIManager.IsInputFocused) return;
-        HandleMovement();
+
+        HandleModeToggle();
+
+        if (currentMode == CameraMode.Free)
+        {
+            HandleFreeLook();
+            HandleFreeMovement();
+        }
+        else if (currentMode == CameraMode.Follow)
+        {
+            HandleFollowInput();
+        }
     }
-    private void HandleLook()
+
+    private void LateUpdate()
+    {
+        if (currentMode == CameraMode.Follow && target != null)
+        {
+            UpdateFollowCameraPosition();
+        }
+    }
+
+    private void HandleModeToggle()
+    {
+        // Toggle camera mode with 'C' key
+        if (Keyboard.current.cKey.wasPressedThisFrame)
+        {
+            currentMode = currentMode == CameraMode.Free ? CameraMode.Follow : CameraMode.Free;
+            Debug.Log($"[CameraController] Camera Mode Switched to: {currentMode}");
+            
+            // Re-sync angles when switching modes to prevent snapping back
+            if (currentMode == CameraMode.Follow) {
+                Vector3 angles = transform.eulerAngles;
+                currentYaw = angles.y;
+                currentPitch = angles.x;
+            }
+        }
+    }
+
+    #region Free Mode Implementation
+
+    private void HandleFreeLook()
     {
         if (Mouse.current.rightButton.isPressed)
         {
-            // Lock and hide cursor while dragging
             if (Cursor.lockState != CursorLockMode.Locked)
             {
                 Cursor.lockState = CursorLockMode.Locked;
@@ -36,14 +109,14 @@ public class CameraController : MonoBehaviour
             }
 
             Vector2 mouseDelta = Mouse.current.delta.ReadValue() * lookSensitivity * Time.deltaTime;
-            yRot += mouseDelta.x;
-            xRot -= mouseDelta.y;
-            xRot = Mathf.Clamp(xRot, -90f, 90f);
-            transform.rotation = Quaternion.Euler(xRot, yRot, 0f);
+            currentYaw += mouseDelta.x;
+            currentPitch -= mouseDelta.y;
+            currentPitch = Mathf.Clamp(currentPitch, -90f, 90f);
+            
+            transform.rotation = Quaternion.Euler(currentPitch, currentYaw, 0f);
         }
         else
         {
-            // Unlock and show cursor when released
             if (Cursor.lockState != CursorLockMode.None)
             {
                 Cursor.lockState = CursorLockMode.None;
@@ -52,7 +125,7 @@ public class CameraController : MonoBehaviour
         }
     }
 
-    private void HandleMovement()
+    private void HandleFreeMovement()
     {
         Vector3 move = Vector3.zero;
 
@@ -61,15 +134,44 @@ public class CameraController : MonoBehaviour
         if (Keyboard.current.aKey.isPressed) move -= transform.right;
         if (Keyboard.current.dKey.isPressed) move += transform.right;
 
-        transform.position += move * moveSpeed * Time.deltaTime;
+        transform.position += move * freeMoveSpeed * Time.deltaTime;
     }
 
-    private void HandleScroll()
+    #endregion
+
+    #region Follow Mode Implementation
+
+    private void HandleFollowInput()
     {
-        float scroll = Mouse.current.scroll.ReadValue().y; // scroll up/down
-        if (Mathf.Abs(scroll) > 0.01f)
+        // Rotation via right click
+        if (Mouse.current.rightButton.isPressed)
         {
-            transform.position += transform.forward * scroll * scrollSpeed * Time.deltaTime;
+            Vector2 mouseDelta = Mouse.current.delta.ReadValue();
+            currentYaw += mouseDelta.x * rotateSpeed;
+            currentPitch -= mouseDelta.y * rotateSpeed;
+            currentPitch = Mathf.Clamp(currentPitch, minPitch, maxPitch);
+        }
+
+        // Zoom via scroll wheel
+        float scroll = Mouse.current.scroll.ReadValue().y;
+        if (scroll != 0)
+        {
+            currentDistance -= scroll * zoomSpeed * 0.01f;
+            currentDistance = Mathf.Clamp(currentDistance, minDistance, maxDistance);
         }
     }
+
+    private void UpdateFollowCameraPosition()
+    {
+        Quaternion rotation = Quaternion.Euler(currentPitch, currentYaw, 0);
+        Vector3 negDistance = new Vector3(0.0f, 0.0f, -currentDistance);
+        
+        Vector3 targetPos = target.position + targetOffset;
+        Vector3 position = rotation * negDistance + targetPos;
+
+        transform.position = Vector3.Lerp(transform.position, position, followSmoothSpeed * Time.deltaTime);
+        transform.rotation = rotation;
+    }
+
+    #endregion
 }

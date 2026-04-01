@@ -122,7 +122,7 @@ public class MotionManager : MonoBehaviour
     }
 
     /// <summary>
-    /// Plays an FBX motion file using the primary playback instance.
+    /// Plays a motion file using the primary playback instance.
     /// </summary>
     public bool PlayMotion(string filePath)
     {
@@ -133,7 +133,7 @@ public class MotionManager : MonoBehaviour
             return false;
         }
 
-        playback.PlayFBX(filePath);
+        playback.PlayMotion(filePath);
         return true;
     }
 }

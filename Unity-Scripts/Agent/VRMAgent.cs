@@ -17,6 +17,9 @@ public class VRMAgent : Agent
     public float moveSpeed = 2f;      
     public float turnSpeed = 100f;    
 
+    [Header("Human Control")]
+    public bool enableHumanControl = false;
+
     private Animator anim;
     private Transform hips;
     private Transform head;
@@ -188,7 +191,7 @@ public class VRMAgent : Agent
         var continuousActions = actionsOut.ContinuousActions;
         for (int i = 0; i < 36; i++) continuousActions[i] = 0f;
 
-        if (Keyboard.current != null)
+        if (Keyboard.current != null && enableHumanControl)
         {
             if (Keyboard.current.wKey.isPressed) continuousActions[33] = 1f;
             if (Keyboard.current.sKey.isPressed) continuousActions[33] = -1f;
@@ -197,168 +200,3 @@ public class VRMAgent : Agent
         }
     }
 }
-
-// Version 1
-
-// using UnityEngine;
-// using Unity.MLAgents;
-// using Unity.MLAgents.Actuators;
-// using Unity.MLAgents.Sensors;
-// using System.Collections.Generic;
-
-// public class VRMAgent : Agent
-// {
-//     [Header("(Target)")]
-//     public Transform targetVRM;
-
-//     private Animator anim;
-    
-//     // 儲存所有需要觀察與控制的骨骼節點 (對應 .bvh 結構)
-//     private List<Transform> boneNodes = new List<Transform>();
-
-//     // 核心根節點定義
-//     private Transform hips;
-//     private Transform head;
-//     private float height = 700f;
-
-//         // 在 OnActionReceived 或 Update 中打印
-//     void Update() {
-//         if (StepCount % 100 == 0) { // 每 100 步打印一次，避免洗版
-//             Debug.Log($"Episode: {CompletedEpisodes} | Reward: {GetCumulativeReward():F2}");
-//         }
-//     }
-
-//     private Vector3 initialPosition;
-
-//     public override void Initialize()
-//     {
-//         anim = GetComponent<Animator>();
-//         if (anim == null || !anim.isHuman)
-//         {
-//             Debug.LogError("物件必須包含 Animator 且設定為 Humanoid！");
-//             return;
-//         }
-
-//         // --- 1. 根據 .bvh 結構自動抓取骨骼 ---
-//         // 根節點 (Root)
-//         hips = anim.GetBoneTransform(HumanBodyBones.Hips);
-        
-//         // 軀幹 (Spine Chain)
-//         boneNodes.Add(anim.GetBoneTransform(HumanBodyBones.Spine));
-//         boneNodes.Add(anim.GetBoneTransform(HumanBodyBones.Chest));
-//         boneNodes.Add(anim.GetBoneTransform(HumanBodyBones.UpperChest));
-//         boneNodes.Add(anim.GetBoneTransform(HumanBodyBones.Neck));
-//         head = anim.GetBoneTransform(HumanBodyBones.Head);
-//         boneNodes.Add(head);
-
-//         // 左臂 (Left Arm)
-//         boneNodes.Add(anim.GetBoneTransform(HumanBodyBones.LeftShoulder));
-//         boneNodes.Add(anim.GetBoneTransform(HumanBodyBones.LeftUpperArm));
-//         boneNodes.Add(anim.GetBoneTransform(HumanBodyBones.LeftLowerArm));
-//         boneNodes.Add(anim.GetBoneTransform(HumanBodyBones.LeftHand));
-
-//         // 右臂 (Right Arm)
-//         boneNodes.Add(anim.GetBoneTransform(HumanBodyBones.RightShoulder));
-//         boneNodes.Add(anim.GetBoneTransform(HumanBodyBones.RightUpperArm));
-//         boneNodes.Add(anim.GetBoneTransform(HumanBodyBones.RightLowerArm));
-//         boneNodes.Add(anim.GetBoneTransform(HumanBodyBones.RightHand));
-
-//         // 左腿 (Left Leg)
-//         boneNodes.Add(anim.GetBoneTransform(HumanBodyBones.LeftUpperLeg));
-//         boneNodes.Add(anim.GetBoneTransform(HumanBodyBones.LeftLowerLeg));
-//         boneNodes.Add(anim.GetBoneTransform(HumanBodyBones.LeftFoot));
-
-//         // 右腿 (Right Leg)
-//         boneNodes.Add(anim.GetBoneTransform(HumanBodyBones.RightUpperLeg));
-//         boneNodes.Add(anim.GetBoneTransform(HumanBodyBones.RightLowerLeg));
-//         boneNodes.Add(anim.GetBoneTransform(HumanBodyBones.RightFoot));
-
-//         // 移除列表中可能存在的 null (部分 VRM 可能沒 UpperChest)
-//         boneNodes.RemoveAll(item => item == null);
-//     }
-
-//     public override void OnEpisodeBegin()
-//     {
-//         anim.enabled = false;
-        
-//         // 讓 Agent 隨機出現在 Target 附近 3~5 公尺處
-//         float randomAngle = Random.Range(0f, Mathf.PI * 2f);
-//         Vector3 offset = new Vector3(Mathf.Cos(randomAngle), 0, Mathf.Sin(randomAngle)) * Random.Range(3f, 5f);
-//         transform.localPosition = initialPosition + offset;
-
-//         // 讓骨骼有更大的隨機性（模擬摔倒）
-//         foreach (var bone in boneNodes)
-//         {
-//             bone.localRotation = Quaternion.Euler(Random.Range(-45, 45), Random.Range(-45, 45), Random.Range(-45, 45));
-//         }
-//     }
-
-
-//     public override void CollectObservations(VectorSensor sensor)
-//     {
-//         // 1. Hips 高度正規化 (Height / 700)
-//         // 這樣數值會落在 0.8~1.2 左右，對 AI 來說非常舒適
-//         sensor.AddObservation(hips.localPosition.y / height); 
-//         sensor.AddObservation(hips.localRotation); // Quaternion 永遠是 -1~1，不需處理
-
-//         // 2. 骨骼旋轉 (不受模型大小影響，直接餵)
-//         foreach (var bone in boneNodes)
-//         {
-//             sensor.AddObservation(bone.localRotation); 
-//         }
-
-//         // 3. 目標相對資訊
-//         Vector3 relativePos = targetVRM.position - hips.position;
-//         sensor.AddObservation(relativePos.normalized); // 方向向量已經是 -1~1
-        
-//         // 假設 3 倍身高外就不在意了 (3 * 700 = 2100)
-//         float normalizedDist = Mathf.Clamp(relativePos.magnitude / (height * 3f), 0f, 1f);
-//         sensor.AddObservation(normalizedDist); 
-//     }
-
-
-//     public override void OnActionReceived(ActionBuffers actions)
-//     {
-//         var contActions = actions.ContinuousActions;
-//         int actionIndex = 0;
-
-//         // 這裡我們讓 AI 控制每一根骨頭的旋轉
-//         // 每個骨頭分配 3 個 Action (X, Y, Z 旋轉)
-//         foreach (var bone in boneNodes)
-//         {
-//             if (actionIndex + 2 < contActions.Length)
-//             {
-//                 float x = contActions[actionIndex++] * 30f; // 限制旋轉幅度
-//                 float y = contActions[actionIndex++] * 30f;
-//                 float z = contActions[actionIndex++] * 30f;
-                
-//                 // 使用 Slerp 平滑過渡，避免模型爆炸
-//                 bone.localRotation = Quaternion.Slerp(bone.localRotation, Quaternion.Euler(x, y, z), Time.fixedDeltaTime * 10f);
-//             }
-//         }
-
-//         // --- 獎勵邏輯 (Rewards) ---
-//         // 獎勵 1: Hips 保持在一定高度 (避免摔倒)
-//         if (hips.position.y > 0.8f && hips.position.y < 1.2f) AddReward(0.01f);
-
-//         // 獎勵 2: 頭部向上
-//         AddReward(Vector3.Dot(head.up, Vector3.up) * 0.1f);
-
-
-//         // 在 OnActionReceived 中加入
-//         float distance = Vector3.Distance(hips.position, targetVRM.position);
-
-//         // 理想社交距離：1.5 倍到 2.5 倍身高
-//         if (distance > height * 1.5f && distance < height * 2.5f) {
-//             AddReward(0.01f); 
-//         } else if (distance <= height * 1.0f) {
-//             AddReward(-0.01f); // 太近了（碰撞邊緣）
-//         }
-//         // B. 對視獎勵 (Look at Target)
-//         Vector3 toTarget = (targetVRM.position - head.position).normalized;
-//         float lookAtDot = Vector3.Dot(head.forward, toTarget); // 1 為正對, -1 為背對
-//         if (lookAtDot > 0.8f) { // 大約正負 30 度內
-//             AddReward(0.01f * lookAtDot); 
-//         }
-//     }
-// }

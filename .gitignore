@@ -10,9 +10,10 @@ python_backend/vits/*.pth
 python_backend/tests/
 python_backend/temp_backup/
 python_backend/tests/
-python_backend/tests/motions
 python_backend/ai-avatar.service
 python_backend/server.log
+
+mixamo_downloads
 
 avatar-agent/ml-agents-develop
 avatar-agent/results
